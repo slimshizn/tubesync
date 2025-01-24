@@ -1,21 +1,31 @@
 '''
-    Wrapper for the youtube-dl library. Used so if there are any library interface
+    Wrapper for the yt-dlp library. Used so if there are any library interface
     updates we only need to udpate them in one place.
 '''
 
 
 import os
+from pathlib import Path
 from django.conf import settings
 from copy import copy
 from common.logger import log
 import yt_dlp
 
 
-_youtubedl_cachedir = getattr(settings, 'YOUTUBE_DL_CACHEDIR', None)
 _defaults = getattr(settings, 'YOUTUBE_DEFAULTS', {})
+_youtubedl_cachedir = getattr(settings, 'YOUTUBE_DL_CACHEDIR', None)
 if _youtubedl_cachedir:
     _youtubedl_cachedir = str(_youtubedl_cachedir)
     _defaults['cachedir'] = _youtubedl_cachedir
+_youtubedl_tempdir = getattr(settings, 'YOUTUBE_DL_TEMPDIR', None)
+if _youtubedl_tempdir:
+    _youtubedl_tempdir = str(_youtubedl_tempdir)
+    _youtubedl_tempdir_path = Path(_youtubedl_tempdir)
+    _youtubedl_tempdir_path.mkdir(parents=True, exist_ok=True)
+    (_youtubedl_tempdir_path / '.ignore').touch(exist_ok=True)
+    _paths = _defaults.get('paths', {})
+    _paths.update({ 'temp': _youtubedl_tempdir, })
+    _defaults['paths'] = _paths
 
 
 
@@ -35,6 +45,82 @@ def get_yt_opts():
         opts.update({'cookiefile': cookie_file_path})
     return opts
 
+def get_channel_id(url):
+    # yt-dlp --simulate --no-check-formats --playlist-items 1
+    #   --print 'pre_process:%(playlist_channel_id,playlist_id,channel_id)s'
+    opts = get_yt_opts()
+    opts.update({
+        'skip_download': True,
+        'simulate': True,
+        'logger': log,
+        'extract_flat': True,  # Change to False to get detailed info
+        'check_formats': False,
+        'playlist_items': '1',
+    })
+
+    with yt_dlp.YoutubeDL(opts) as y:
+        try:
+            response = y.extract_info(url, download=False)
+        except yt_dlp.utils.DownloadError as e:
+            raise YouTubeError(f'Failed to extract channel ID for "{url}": {e}') from e
+        else:
+            try:
+                channel_id = response['channel_id']
+            except Exception as e:
+                raise YouTubeError(f'Failed to extract channel ID for "{url}": {e}') from e
+            else:
+                return channel_id
+
+def get_channel_image_info(url):
+    opts = get_yt_opts()
+    opts.update({
+        'skip_download': True,
+        'simulate': True,
+        'logger': log,
+        'extract_flat': True,  # Change to False to get detailed info
+    })
+
+    with yt_dlp.YoutubeDL(opts) as y:
+        try:
+            response = y.extract_info(url, download=False)
+            
+            avatar_url = None
+            banner_url = None
+            for thumbnail in response['thumbnails']:
+                if thumbnail['id'] == 'avatar_uncropped':
+                    avatar_url = thumbnail['url']
+                if thumbnail['id'] == 'banner_uncropped':
+                    banner_url = thumbnail['url']
+                if banner_url != None and avatar_url != None:
+                    break
+                    
+            return avatar_url, banner_url
+        except yt_dlp.utils.DownloadError as e:
+            raise YouTubeError(f'Failed to extract channel info for "{url}": {e}') from e
+
+
+def _subscriber_only(msg='', response=None):
+    if response is None:
+        # process msg only
+        msg = str(msg)
+        if 'access to members-only content' in msg:
+            return True
+        if ': Join this channel' in msg:
+            return True
+        if 'Join this YouTube channel' in msg:
+            return True
+    else:
+        # ignore msg entirely
+        if not isinstance(response, dict):
+            raise TypeError(f'response must be a dict, got "{type(response)}" instead')
+
+        if 'availability' not in response.keys():
+            return False
+
+        # check for the specific expected value
+        return 'subscriber_only' == response.get('availability')
+    return False
+
 
 def get_media_info(url):
     '''
@@ -44,8 +130,9 @@ def get_media_info(url):
     '''
     opts = get_yt_opts()
     opts.update({
+        'ignoreerrors': False, # explicitly set this to catch exceptions
+        'ignore_no_formats_error': False, # we must fail first to try again with this enabled
         'skip_download': True,
-        'forcejson': True,
         'simulate': True,
         'logger': log,
         'extract_flat': True,
@@ -55,7 +142,19 @@ def get_media_info(url):
         try:
             response = y.extract_info(url, download=False)
         except yt_dlp.utils.DownloadError as e:
-            raise YouTubeError(f'Failed to extract_info for "{url}": {e}') from e
+            if not _subscriber_only(msg=e.msg):
+                raise YouTubeError(f'Failed to extract_info for "{url}": {e}') from e
+            # adjust options and try again
+            opts.update({'ignore_no_formats_error': True,})
+            with yt_dlp.YoutubeDL(opts) as yy:
+                try:
+                    response = yy.extract_info(url, download=False)
+                except yt_dlp.utils.DownloadError as ee:
+                    raise YouTubeError(f'Failed (again) to extract_info for "{url}": {ee}') from ee
+                # validate the response is what we expected
+                if not _subscriber_only(response=response):
+                    response = {}
+
     if not response:
         raise YouTubeError(f'Failed to extract_info for "{url}": No metadata was '
                            f'returned by youtube-dl, check for error messages in the '
@@ -64,13 +163,20 @@ def get_media_info(url):
     return response
 
 
-def download_media(url, media_format, extension, output_file, info_json):
+def download_media(url, media_format, extension, output_file, info_json,
+                   sponsor_categories=None,
+                   embed_thumbnail=False, embed_metadata=False, skip_sponsors=True,
+                   write_subtitles=False, auto_subtitles=False, sub_langs='en'):
     '''
         Downloads a YouTube URL to a file on disk.
     '''
 
     def hook(event):
         filename = os.path.basename(event['filename'])
+
+        if event.get('downloaded_bytes') is None or event.get('total_bytes') is None:
+            return None
+
         if event['status'] == 'error':
             log.error(f'[youtube-dl] error occured downloading: {filename}')
         elif event['status'] == 'downloading':
@@ -99,17 +205,45 @@ def download_media(url, media_format, extension, output_file, info_json):
                      f'{total_size_str} in {elapsed_str}')
         else:
             log.warn(f'[youtube-dl] unknown event: {str(event)}')
-    hook.download_progress = 0
 
-    opts = get_yt_opts()
-    opts.update({
+    hook.download_progress = 0
+    ytopts = {
         'format': media_format,
         'merge_output_format': extension,
-        'outtmpl': output_file,
-        'quiet': True,
+        'outtmpl': os.path.basename(output_file),
+        'quiet': False if settings.DEBUG else True,
+        'verbose': True if settings.DEBUG else False,
+        'noprogress': None if settings.DEBUG else True,
         'progress_hooks': [hook],
-        'writeinfojson': info_json
+        'writeinfojson': info_json,
+        'postprocessors': [],
+        'writesubtitles': write_subtitles,
+        'writeautomaticsub': auto_subtitles,
+        'subtitleslangs': sub_langs.split(','),
+    }
+    if not sponsor_categories:
+        sponsor_categories = []
+    sbopt = {
+        'key': 'SponsorBlock',
+        'categories': sponsor_categories
+    }
+    ffmdopt = {
+        'key': 'FFmpegMetadata',
+        'add_chapters': embed_metadata,
+        'add_metadata': embed_metadata
+    }
+    opts = get_yt_opts()
+    ytopts['paths'] = opts.get('paths', {})
+    ytopts['paths'].update({
+        'home': os.path.dirname(output_file),
     })
+    if embed_thumbnail:
+        ytopts['postprocessors'].append({'key': 'EmbedThumbnail'})
+    if skip_sponsors:
+        ytopts['postprocessors'].append(sbopt)
+    ytopts['postprocessors'].append(ffmdopt)
+    opts.update(ytopts)
+
     with yt_dlp.YoutubeDL(opts) as y:
         try:
             return y.download([url])
