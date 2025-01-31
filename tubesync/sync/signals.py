@@ -1,4 +1,6 @@
 import os
+import glob
+from pathlib import Path
 from django.conf import settings
 from django.db.models.signals import pre_save, post_save, pre_delete, post_delete
 from django.dispatch import receiver
@@ -10,8 +12,11 @@ from .models import Source, Media, MediaServer
 from .tasks import (delete_task_by_source, delete_task_by_media, index_source_task,
                     download_media_thumbnail, download_media_metadata,
                     map_task_to_instance, check_source_directory_exists,
-                    download_media, rescan_media_server)
-from .utils import delete_file
+                    download_media, rescan_media_server, download_source_images,
+                    save_all_media_for_source, rename_all_media_for_source,
+                    get_media_metadata_task)
+from .utils import delete_file, glob_quote
+from .filtering import filter_media
 
 
 @receiver(pre_save, sender=Source)
@@ -47,6 +52,12 @@ def source_post_save(sender, instance, created, **kwargs):
             priority=0,
             verbose_name=verbose_name.format(instance.name)
         )
+        if instance.source_type != Source.SOURCE_TYPE_YOUTUBE_PLAYLIST and instance.copy_channel_images:
+            download_source_images(
+                str(instance.pk),
+                priority=2,
+                verbose_name=verbose_name.format(instance.name)
+            )
         if instance.index_schedule > 0:
             delete_task_by_source('sync.tasks.index_source_task', instance.pk)
             log.info(f'Scheduling media indexing for source: {instance.name}')
@@ -59,10 +70,31 @@ def source_post_save(sender, instance, created, **kwargs):
                 verbose_name=verbose_name.format(instance.name),
                 remove_existing_tasks=True
             )
-    # Trigger the post_save signal for each media item linked to this source as various
-    # flags may need to be recalculated
-    for media in Media.objects.filter(source=instance):
-        media.save()
+    # Check settings before any rename tasks are scheduled
+    rename_sources_setting = settings.RENAME_SOURCES or list()
+    create_rename_task = (
+        (
+            instance.directory and
+            instance.directory in rename_sources_setting
+        ) or
+        settings.RENAME_ALL_SOURCES
+    )
+    if create_rename_task:
+        verbose_name = _('Renaming all media for source "{}"')
+        rename_all_media_for_source(
+            str(instance.pk),
+            queue=str(instance.pk),
+            priority=1,
+            verbose_name=verbose_name.format(instance.name),
+            remove_existing_tasks=False
+        )
+    verbose_name = _('Checking all media for source "{}"')
+    save_all_media_for_source(
+        str(instance.pk),
+        priority=2,
+        verbose_name=verbose_name.format(instance.name),
+        remove_existing_tasks=True
+    )
 
 
 @receiver(pre_delete, sender=Source)
@@ -90,46 +122,24 @@ def task_task_failed(sender, task_id, completed_task, **kwargs):
         obj.has_failed = True
         obj.save()
 
+    if isinstance(obj, Media) and completed_task.task_name == "sync.tasks.download_media_metadata":
+        log.error(f'Permanent failure for media: {obj} task: {completed_task}')
+        obj.skip = True
+        obj.save()
 
 @receiver(post_save, sender=Media)
 def media_post_save(sender, instance, created, **kwargs):
+    # If the media is skipped manually, bail.
+    if instance.manual_skip:
+        return
     # Triggered after media is saved
-    cap_changed = False
+    skip_changed = False
     can_download_changed = False
     # Reset the skip flag if the download cap has changed if the media has not
     # already been downloaded
-    if not instance.downloaded:
-        max_cap_age = instance.source.download_cap_date
-        published = instance.published
-        if not published:
-            if not instance.skip:
-                log.warn(f'Media: {instance.source} / {instance} has no published date '
-                         f'set, marking to be skipped')
-                instance.skip = True
-                cap_changed = True
-            else:
-                log.debug(f'Media: {instance.source} / {instance} has no published date '
-                          f'set but is already marked to be skipped')
-        else:
-            if max_cap_age:
-                if published > max_cap_age and instance.skip:
-                    # Media was published after the cap date but is set to be skipped
-                    log.info(f'Media: {instance.source} / {instance} has a valid '
-                            f'publishing date, marking to be unskipped')
-                    instance.skip = False
-                    cap_changed = True
-                elif published <= max_cap_age and not instance.skip:
-                    log.info(f'Media: {instance.source} / {instance} is too old for '
-                            f'the download cap date, marking to be skipped')
-                    instance.skip = True
-                    cap_changed = True
-            else:
-                if instance.skip:
-                    # Media marked to be skipped but source download cap removed
-                    log.info(f'Media: {instance.source} / {instance} has a valid '
-                            f'publishing date, marking to be unskipped')
-                    instance.skip = False
-                    cap_changed = True
+    if not instance.downloaded and instance.metadata:
+        skip_changed = filter_media(instance)
+
     # Recalculate the "can_download" flag, this may
     # need to change if the source specifications have been changed
     if instance.metadata:
@@ -142,24 +152,24 @@ def media_post_save(sender, instance, created, **kwargs):
                 instance.can_download = False
                 can_download_changed = True
     # Save the instance if any changes were required
-    if cap_changed or can_download_changed:
+    if skip_changed or can_download_changed:
         post_save.disconnect(media_post_save, sender=Media)
         instance.save()
         post_save.connect(media_post_save, sender=Media)
     # If the media is missing metadata schedule it to be downloaded
-    if not instance.metadata:
+    if not instance.metadata and not instance.skip and not get_media_metadata_task(instance.pk):
         log.info(f'Scheduling task to download metadata for: {instance.url}')
         verbose_name = _('Downloading metadata for "{}"')
         download_media_metadata(
             str(instance.pk),
-            priority=10,
+            priority=5,
             verbose_name=verbose_name.format(instance.pk),
             remove_existing_tasks=True
         )
-    # If the media is missing a thumbnail schedule it to be downloaded
+    # If the media is missing a thumbnail schedule it to be downloaded (unless we are skipping this media)
     if not instance.thumb_file_exists:
         instance.thumb = None
-    if not instance.thumb:
+    if not instance.thumb and not instance.skip:
         thumbnail_url = instance.thumbnail
         if thumbnail_url:
             log.info(f'Scheduling task to download thumbnail for: {instance.name} '
@@ -184,7 +194,7 @@ def media_post_save(sender, instance, created, **kwargs):
         download_media(
             str(instance.pk),
             queue=str(instance.source.pk),
-            priority=15,
+            priority=10,
             verbose_name=verbose_name.format(instance.name),
             remove_existing_tasks=True
         )
@@ -203,6 +213,59 @@ def media_pre_delete(sender, instance, **kwargs):
 
 @receiver(post_delete, sender=Media)
 def media_post_delete(sender, instance, **kwargs):
+    # Remove thumbnail file for deleted media
+    if instance.thumb:
+        instance.thumb.delete(save=False)
+    # Remove the video file, when configured to do so
+    if instance.source.delete_files_on_disk and instance.media_file:
+        video_path = Path(str(instance.media_file.path)).resolve()
+        instance.media_file.delete(save=False)
+        # the other files we created have these known suffixes
+        for suffix in frozenset(('nfo', 'jpg', 'webp', 'info.json',)):
+            other_path = video_path.with_suffix(f'.{suffix}').resolve()
+            log.info(f'Deleting file for: {instance} path: {other_path!s}')
+            delete_file(other_path)
+        # Jellyfin creates .trickplay directories and posters
+        for suffix in frozenset(('.trickplay', '-poster.jpg', '-poster.webp',)):
+            # with_suffix insists on suffix beginning with '.' for no good reason
+            other_path = Path(str(video_path.with_suffix('')) + suffix).resolve()
+            if other_path.is_file():
+                log.info(f'Deleting file for: {instance} path: {other_path!s}')
+                delete_file(other_path)
+            elif other_path.is_dir():
+                # Delete the contents of the directory
+                paths = list(other_path.rglob('*'))
+                attempts = len(paths)
+                while paths and attempts > 0:
+                    attempts -= 1
+                    # delete files first
+                    for p in list(filter(lambda x: x.is_file(), paths)):
+                        log.info(f'Deleting file for: {instance} path: {p!s}')
+                        delete_file(p)
+                    # refresh the list
+                    paths = list(other_path.rglob('*'))
+                    # delete directories
+                    # a directory with a subdirectory will fail
+                    # we loop to try removing each of them
+                    # a/b/c: c then b then a, 3 times around the loop
+                    for p in list(filter(lambda x: x.is_dir(), paths)):
+                        try:
+                            p.rmdir()
+                            log.info(f'Deleted directory for: {instance} path: {p!s}')
+                        except OSError as e:
+                            pass
+                # Delete the directory itself
+                try:
+                    other_path.rmdir()
+                    log.info(f'Deleted directory for: {instance} path: {other_path!s}')
+                except OSError as e:
+                    pass
+        # Get all files that start with the bare file path
+        all_related_files = video_path.parent.glob(f'{glob_quote(video_path.with_suffix("").name)}*')
+        for file in all_related_files:
+            log.info(f'Deleting file for: {instance} path: {file}')
+            delete_file(file)
+
     # Schedule a task to update media servers
     for mediaserver in MediaServer.objects.all():
         log.info(f'Scheduling media server updates')
@@ -213,3 +276,4 @@ def media_post_delete(sender, instance, **kwargs):
             verbose_name=verbose_name.format(mediaserver),
             remove_existing_tasks=True
         )
+

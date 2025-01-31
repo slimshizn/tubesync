@@ -5,7 +5,7 @@ umask "$UMASK_SET"
 
 cd /app || exit
 
-PIDFILE=/run/app/gunicorn.pid
+PIDFILE=/run/app/celery-worker.pid
 
 if [ -f "${PIDFILE}" ]
 then
@@ -20,5 +20,5 @@ then
     rm ${PIDFILE}
 fi
 
-exec s6-setuidgid app \
-    /usr/local/bin/gunicorn -c /app/tubesync/gunicorn.py --capture-output tubesync.wsgi:application
+#exec s6-setuidgid app \
+#    /usr/local/bin/celery --workdir /app -A tubesync worker --pidfile ${PIDFILE} -l INFO

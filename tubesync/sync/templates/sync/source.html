@@ -43,6 +43,18 @@
         <td class="hide-on-small-only">Directory</td>
         <td><span class="hide-on-med-and-up">Directory<br></span><strong>{{ source.directory }}</strong></td>
       </tr>
+      <tr title="Filter text">
+        <td class="hide-on-small-only">Filter text{% if source.filter_text_invert %} <em>Inverted</em>{% endif %}</td>
+        <td><span class="hide-on-med-and-up">Filter text{% if source.filter_text_invert %} <em>Inverted</em>{% endif %}<br></span>
+          <strong>{{ source.filter_text }}</strong></td>
+      </tr>
+      {% if source.filter_seconds %}
+      <tr title="Do not download videos shorter/longer than this limit seconds">
+        <td class="hide-on-small-only">Filter Seconds</td>
+        <td><span class="hide-on-med-and-up">Filter seconds<br>
+        </span><strong>{{ source.filter_seconds }}s {% if source.filter_seconds_min %}(Minimum length){% else %}(Maximum Length){% endif %}</strong></td>
+      </tr>
+      {% endif %}
       <tr title="Media file name format to use for saving files">
         <td class="hide-on-small-only">Media format</td>
         <td><span class="hide-on-med-and-up">Media format<br></span><strong>{{ source.media_format }}</strong></td>
@@ -60,6 +72,14 @@
       <tr title="Schedule of how often to index the source for new media">
         <td class="hide-on-small-only">Index schedule</td>
         <td><span class="hide-on-med-and-up">Index schedule<br></span><strong>{{ source.get_index_schedule_display }}</strong></td>
+      </tr>
+      <tr title="Index videos from this source">
+        <td class="hide-on-small-only">Index videos?</td>
+        <td><span class="hide-on-med-and-up">Index videos?<br></span><strong>{% if source.index_videos %}<i class="fas fa-check"></i>{% else %}<i class="fas fa-times"></i>{% endif %}</strong></td>
+      </tr>
+      <tr title="Index streams from this source">
+        <td class="hide-on-small-only">Index streams?</td>
+        <td><span class="hide-on-med-and-up">Index streams?<br></span><strong>{% if source.index_streams %}<i class="fas fa-check"></i>{% else %}<i class="fas fa-times"></i>{% endif %}</strong></td>
       </tr>
       <tr title="Download media from this source">
         <td class="hide-on-small-only">Download media?</td>
@@ -115,6 +135,14 @@
         <td class="hide-on-small-only">Write JSON?</td>
         <td><span class="hide-on-med-and-up">Write JSON?<br></span><strong>{% if source.write_json %}<i class="fas fa-check"></i>{% else %}<i class="fas fa-times"></i>{% endif %}</strong></td>
       </tr>
+      <tr title="Delete media that is no longer on this playlist?">
+        <td class="hide-on-small-only">Delete removed media</td>
+        <td><span class="hide-on-med-and-up">Delete removed media<br></span><strong>{% if source.delete_removed_media %}<i class="fas fa-check"></i>{% else %}<i class="fas fa-times"></i>{% endif %}</strong></td>
+      </tr>
+        <tr title="Delete files on disk when they are removed from TubeSync?">
+        <td class="hide-on-small-only">Delete files on disk</td>
+        <td><span class="hide-on-med-and-up">Delete files on disk<br></span><strong>{% if source.delete_files_on_disk %}<i class="fas fa-check"></i>{% else %}<i class="fas fa-times"></i>{% endif %}</strong></td>
+      </tr>
       {% if source.delete_old_media and source.days_to_keep > 0 %}
       <tr title="Days after which your media from this source will be locally deleted">
         <td class="hide-on-small-only">Delete old media</td>
@@ -130,6 +158,55 @@
         <td class="hide-on-small-only">UUID</td>
         <td><span class="hide-on-med-and-up">UUID<br></span><strong>{{ source.uuid }}</strong></td>
       </tr>
+      <tr title="{{ _('Embedding thumbnail?') }}">
+        <td class="hide-on-small-only">{{ _("Embed thumbnail?") }}:</td>
+        <td><span class="hide-on-med-and-up">{{ _("Embed thumbnail?") }}<br></span><strong><i class="fas {% if source.embed_thumbnail %}fa-check{% else %}fa-times{% endif %}"></i></strong></td>
+      </tr>
+      <tr title="{{ _('Embedding metadata?') }}">
+        <td class="hide-on-small-only">{{ _("Embed metadata?") }}:</td>
+        <td><span class="hide-on-med-and-up">{{ _("Embed metadata?") }}<br></span><strong><i class="fas {% if source.embed_metadata %}fa-check{% else %}fa-times{% endif %}"></i></strong></td>
+      </tr>
+
+      <tr title="{{ _('Is sponsorblock enabled?') }}">
+        <td class="hide-on-small-only">{{ _("SponsorBlock?") }}:</td>
+        <td><span class="hide-on-med-and-up">{{ _("Sponsorblock enabled?") }}<br></span><strong><i class="fas {% if source.enable_sponsorblock %}fa-check{% else %}fa-times{% endif %}"></i></strong></td>
+      </tr>
+
+      {% if source.enable_sponsorblock %}
+      <tr title="{{ _('SponsorBlock: What to block?') }}">
+        <td class="hide-on-small-only">{{ _("What blocked?") }}:</td>
+        <td><span class="hide-on-med-and-up">{{ _("What blocked?") }}<br></span><strong>
+          {% if source.sponsorblock_categories.all_choice in source.sponsorblock_categories.selected_choices %}
+            {% for k,v in source.sponsorblock_categories.possible_choices %}
+              {{ v }}: <i class="fas fa-check"></i><BR>
+            {% endfor %}
+          {% else %}
+            {% for c in source.sponsorblock_categories.selected_choices %} 
+              {% for k,v in source.sponsorblock_categories.possible_choices %}
+                {% if k == c %} {{ v }}: <i class="fas fa-check"></i><BR>{% endif %}
+              {% endfor %}
+            {% endfor %}
+          {% endif %}
+        </strong></td>
+      </tr>
+      {% endif %}
+
+      <tr title="{{ _('Are Subtitles downloaded?') }}">
+        <td class="hide-on-small-only">{{ _("Download subtitles?") }}:</td>
+        <td><span class="hide-on-med-and-up">{{ _("Download subtitles?") }}:</span><strong><i class="fas {% if source.write_subtitles %}fa-check{% else %}fa-times{% endif %}"></i></strong></td>
+      </tr>
+
+      {% if source.write_subtitles %}
+      <tr title="{{ _('Are auto subs accepted?') }}">
+        <td class="hide-on-small-only">{{ _("Auto-generated subtitles?") }}:</td>
+        <td><span class="hide-on-med-and-up">{{ _("Auto-generated subtitles?") }}:</span><strong><i class="fas {% if source.auto_subtitles %}fa-check{% else %}fa-times{% endif %}"></i></strong></td>
+      </tr>
+      <tr title="{{ _('Subs langs?') }}">
+        <td class="hide-on-small-only">{{ _("Subs langs?") }}:</td>
+        <td><span class="hide-on-med-and-up">{{ _("Subs langs?") }}:</span><strong>{{source.sub_langs}}</strong></td>
+      </tr>
+      {% endif %}
+      
     </table>
   </div>
 </div>

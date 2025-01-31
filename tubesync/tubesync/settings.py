@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 
@@ -6,7 +7,7 @@ CONFIG_BASE_DIR = BASE_DIR
 DOWNLOADS_BASE_DIR = BASE_DIR
 
 
-VERSION = '0.10.0'
+VERSION = '0.13.7'
 SECRET_KEY = ''
 DEBUG = False
 ALLOWED_HOSTS = []
@@ -96,7 +97,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 
 LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'UTC'
+TIME_ZONE = os.getenv('TZ', 'UTC')
 USE_I18N = True
 USE_L10N = True
 USE_TZ = True
@@ -138,7 +139,7 @@ BACKGROUND_TASK_ASYNC_THREADS = 1           # Number of async tasks to run at on
 MAX_BACKGROUND_TASK_ASYNC_THREADS = 8       # For sanity reasons
 BACKGROUND_TASK_PRIORITY_ORDERING = 'ASC'   # Use 'niceness' task priority ordering
 COMPLETED_TASKS_DAYS_TO_KEEP = 7            # Number of days to keep completed tasks
-
+MAX_ENTRIES_PROCESSING = 0                  # Number of videos to process on source refresh (0 for no limit)
 
 SOURCES_PER_PAGE = 100
 MEDIA_PER_PAGE = 144
@@ -149,13 +150,22 @@ MEDIA_THUMBNAIL_WIDTH = 430                 # Width in pixels to resize thumbnai
 MEDIA_THUMBNAIL_HEIGHT = 240                # Height in pixels to resize thumbnails to
 
 
-VIDEO_HEIGHT_CUTOFF = 240       # Smallest resolution in pixels permitted to download
-VIDEO_HEIGHT_IS_HD = 500        # Height in pixels to count as 'HD'
+VIDEO_HEIGHT_CUTOFF = 240                   # Smallest resolution in pixels permitted to download
+VIDEO_HEIGHT_IS_HD = 500                    # Height in pixels to count as 'HD'
+
+
+
+# If True source directories are prefixed with their type (either 'video' or 'audio')
+# e.g. /downloads/video/SomeSourceName
+# If False, sources are placed directly in /downloads
+# e.g. /downloads/SomeSourceName
+SOURCE_DOWNLOAD_DIRECTORY_PREFIX = True
 
 
 YOUTUBE_DL_CACHEDIR = None
+YOUTUBE_DL_TEMPDIR = None
 YOUTUBE_DEFAULTS = {
-    'no_color': True,       # Do not use colours in output
+    'color': 'never',       # Do not use colours in output
     'age_limit': 99,        # 'Age in years' to spoof
     'ignoreerrors': True,   # Skip on errors (such as unavailable videos in playlists)
     'cachedir': False,      # Disable on-disk caching
@@ -165,6 +175,10 @@ COOKIES_FILE = CONFIG_BASE_DIR / 'cookies.txt'
 
 
 MEDIA_FORMATSTR_DEFAULT = '{yyyy_mm_dd}_{source}_{title}_{key}_{format}.{ext}'
+
+
+RENAME_ALL_SOURCES = False
+RENAME_SOURCES = None
 
 
 try:
