@@ -69,11 +69,12 @@ currently just Plex, to complete the PVR experience.
 # Installation
 
 TubeSync is designed to be run in a container, such as via Docker or Podman. It also
-works in a Docker Compose stack. Only `amd64` is initially supported.
+works in a Docker Compose stack. `amd64` (most desktop PCs and servers) and `arm64`
+(modern ARM computers, such as the Rasperry Pi 3 or later) are supported.
 
 Example (with Docker on *nix):
 
-First find your the user ID and group ID you want to run TubeSync as, if you're not
+First find the user ID and group ID you want to run TubeSync as, if you're not
 sure what this is it's probably your current user ID and group ID:
 
 ```bash
@@ -116,11 +117,12 @@ $ docker run \
 Once running, open `http://localhost:4848` in your browser and you should see the
 TubeSync dashboard. If you do, you can proceed to adding some sources (YouTube channels
 and playlists). If not, check `docker logs tubesync` to see what errors might be
-occuring, typical ones are file permission issues.
+occurring, typical ones are file permission issues.
 
 Alternatively, for Docker Compose, you can use something like:
 
-```yaml
+```yml
+services:
   tubesync:
     image: ghcr.io/meeb/tubesync:latest
     container_name: tubesync
@@ -136,6 +138,11 @@ Alternatively, for Docker Compose, you can use something like:
       - PGID=1000
 ```
 
+> [!IMPORTANT]  
+> If the `/downloads` directory is mounted from a [Samba volume](https://docs.docker.com/engine/storage/volumes/#create-cifssamba-volumes), be sure to also supply the `uid` and `gid` mount parameters in the driver options.
+> These must be matched to the `PUID` and `PGID` values, which were specified as environment variables.
+> 
+> Matching these user and group ID numbers prevents issues when executing file actions, such as writing metadata. See [this issue](https://github.com/meeb/tubesync/issues/616#issuecomment-2593458282) for details.
 
 ## Optional authentication
 
@@ -148,7 +155,7 @@ HTTP_USER
 HTTP_PASS
 ```
 
-For example in the `docker run ...` line add in:
+For example, in the `docker run ...` line add in:
 
 ```bash
 ...
@@ -238,6 +245,7 @@ and less common features:
  * [Reset tasks from the command line](https://github.com/meeb/tubesync/blob/main/docs/reset-tasks.md)
  * [Using PostgreSQL, MySQL or MariaDB as database backends](https://github.com/meeb/tubesync/blob/main/docs/other-database-backends.md)
  * [Using cookies](https://github.com/meeb/tubesync/blob/main/docs/using-cookies.md)
+ * [Reset metadata](https://github.com/meeb/tubesync/blob/main/docs/reset-metadata.md)
 
 
 # Warnings
@@ -291,15 +299,15 @@ your install is doing check the container logs.
 
 ### Are there alerts when a download is complete?
 
-No, this feature is best served by existing services such as the execelent
+No, this feature is best served by existing services such as the excellent 
 [Tautulli](https://tautulli.com/) which can monitor your Plex server and send alerts
 that way.
 
-### There's errors in my "tasks" tab!
+### There are errors in my "tasks" tab!
 
 You only really need to worry about these if there is a permanent failure. Some errors
-are temproary and will be retried for you automatically, such as a download got
-interrupted and will be tried again later. Sources with permanet errors (such as no
+are temporary and will be retried for you automatically, such as a download got
+interrupted and will be tried again later. Sources with permanent errors (such as no
 media available because you got a channel name wrong) will be shown as errors on the
 "sources" tab.
 
@@ -317,11 +325,11 @@ Notable libraries and software used:
  * [django-sass](https://github.com/coderedcorp/django-sass/)
  * The container bundles with `s6-init` and `nginx`
 
-See the [Pipefile](https://github.com/meeb/tubesync/blob/main/Pipfile) for a full list.
+See the [Pipfile](https://github.com/meeb/tubesync/blob/main/Pipfile) for a full list.
 
 ### Can I get access to the full Django admin?
 
-Yes, although pretty much all operations are available through the front end interface
+Yes, although pretty much all operations are available through the front-end interface
 and you can probably break things by playing in the admin. If you still want to access
 it you can run:
 
@@ -345,7 +353,16 @@ etc.). Configuration of this is beyond the scope of this README.
 
 ### What architectures does the container support?
 
-Just `amd64` for the moment. Others may be made available if there is demand.
+Only two are supported, for the moment:
+- `amd64` (most desktop PCs and servers)
+-  `arm64`
+(modern ARM computers, such as the Rasperry Pi 3 or later)
+
+Others may be made available, if there is demand.
+
+### The pipenv install fails with "Locking failed"!
+
+Make sure that you have `mysql_config` or `mariadb_config` available, as required by the python module `mysqlclient`. On Debian-based systems this is usually found in the package `libmysqlclient-dev`
 
 
 # Advanced configuration
@@ -354,25 +371,28 @@ There are a number of other environment variables you can set. These are, mostly
 **NOT** required to be set in the default container installation, they are really only
 useful if you are manually installing TubeSync in some other environment. These are:
 
-| Name                     | What                                                         | Example                              |
-| ------------------------ | ------------------------------------------------------------ | ------------------------------------ |
-| DJANGO_SECRET_KEY        | Django's SECRET_KEY                                          | YJySXnQLB7UVZw2dXKDWxI5lEZaImK6l     |
-| DJANGO_FORCE_SCRIPT_NAME | Django's FORCE_SCRIPT_NAME                                   | /somepath                            |
-| TUBESYNC_DEBUG           | Enable debugging                                             | True                                 |
-| TUBESYNC_WORKERS         | Number of background workers, default is 2, max allowed is 8 | 2                                    |
-| TUBESYNC_HOSTS           | Django's ALLOWED_HOSTS, defaults to `*`                      | tubesync.example.com,otherhost.com   |
-| GUNICORN_WORKERS         | Number of gunicorn workers to spawn                          | 3                                    |
-| LISTEN_HOST              | IP address for gunicorn to listen on                         | 127.0.0.1                            |
-| LISTEN_PORT              | Port number for gunicorn to listen on                        | 8080                                 |
-| HTTP_USER                | Sets the username for HTTP basic authentication              | some-username                        |
-| HTTP_PASS                | Sets the password for HTTP basic authentication              | some-secure-password                 |
-| DATABASE_CONNECTION      | Optional external database connection details                | mysql://user:pass@host:port/database |
+| Name                         | What                                                          | Example                              |
+| ---------------------------- | ------------------------------------------------------------- |--------------------------------------|
+| DJANGO_SECRET_KEY            | Django's SECRET_KEY                                           | YJySXnQLB7UVZw2dXKDWxI5lEZaImK6l     |
+| DJANGO_URL_PREFIX            | Run TubeSync in a sub-URL on the web server                   | /somepath/                           |
+| TUBESYNC_DEBUG               | Enable debugging                                              | True                                 |
+| TUBESYNC_WORKERS             | Number of background workers, default is 2, max allowed is 8  | 2                                    |
+| TUBESYNC_HOSTS               | Django's ALLOWED_HOSTS, defaults to `*`                       | tubesync.example.com,otherhost.com   |
+| TUBESYNC_RESET_DOWNLOAD_DIR  | Toggle resetting `/downloads` permissions, defaults to True   | True                                 |
+| TUBESYNC_VIDEO_HEIGHT_CUTOFF | Smallest video height in pixels permitted to download         | 240                                  |
+| TUBESYNC_DIRECTORY_PREFIX    | Enable `video` and `audio` directory prefixes in `/downloads` | True                                 |
+| GUNICORN_WORKERS             | Number of gunicorn workers to spawn                           | 3                                    |
+| LISTEN_HOST                  | IP address for gunicorn to listen on                          | 127.0.0.1                            |
+| LISTEN_PORT                  | Port number for gunicorn to listen on                         | 8080                                 |
+| HTTP_USER                    | Sets the username for HTTP basic authentication               | some-username                        |
+| HTTP_PASS                    | Sets the password for HTTP basic authentication               | some-secure-password                 |
+| DATABASE_CONNECTION          | Optional external database connection details                 | mysql://user:pass@host:port/database |
 
 
 # Manual, non-containerised, installation
 
 As a relatively normal Django app you can run TubeSync without the container. Beyond
-following this rough guide you are on your own and should be knowledgeable about
+following this rough guide, you are on your own and should be knowledgeable about
 installing and running WSGI-based Python web applications before attempting this.
 
 1. Clone or download this repo
@@ -395,7 +415,7 @@ installing and running WSGI-based Python web applications before attempting this
 
 # Tests
 
-There is a moderately comprehensive test suite focussing on the custom media format
+There is a moderately comprehensive test suite focusing on the custom media format
 matching logic and that the front-end interface works. You can run it via Django:
 
 ```bash

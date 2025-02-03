@@ -6,14 +6,19 @@
 
 
 import logging
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
 from django.conf import settings
-from django.test import TestCase, Client
+from django.test import TestCase, Client, override_settings
 from django.utils import timezone
 from background_task.models import Task
 from .models import Source, Media
+from .tasks import cleanup_old_media
+from .filtering import filter_media
+from .utils import filter_response
 
 
 class FrontEndTestCase(TestCase):
@@ -21,7 +26,7 @@ class FrontEndTestCase(TestCase):
     def setUp(self):
         # Disable general logging for test case
         logging.disable(logging.CRITICAL)
-    
+
     def test_dashboard(self):
         c = Client()
         response = c.get('/')
@@ -36,6 +41,9 @@ class FrontEndTestCase(TestCase):
         test_sources = {
             'youtube-channel': {
                 'valid': (
+                    'https://m.youtube.com/testchannel',
+                    'https://m.youtube.com/c/testchannel',
+                    'https://m.youtube.com/c/testchannel/videos',
                     'https://www.youtube.com/testchannel',
                     'https://www.youtube.com/c/testchannel',
                     'https://www.youtube.com/c/testchannel/videos',
@@ -47,6 +55,7 @@ class FrontEndTestCase(TestCase):
                 'invalid_domain': (
                     'https://www.test.com/c/testchannel',
                     'https://www.example.com/c/testchannel',
+                    'https://n.youtube.com/c/testchannel',
                 ),
                 'invalid_path': (
                     'https://www.youtube.com/test/invalid',
@@ -62,6 +71,8 @@ class FrontEndTestCase(TestCase):
             },
             'youtube-channel-id': {
                 'valid': (
+                    'https://m.youtube.com/channel/channelid',
+                    'https://m.youtube.com/channel/channelid/videos',
                     'https://www.youtube.com/channel/channelid',
                     'https://www.youtube.com/channel/channelid/videos',
                 ),
@@ -72,6 +83,7 @@ class FrontEndTestCase(TestCase):
                 'invalid_domain': (
                     'https://www.test.com/channel/channelid',
                     'https://www.example.com/channel/channelid',
+                    'https://n.youtube.com/channel/channelid',
                 ),
                 'invalid_path': (
                     'https://www.youtube.com/test/invalid',
@@ -83,6 +95,8 @@ class FrontEndTestCase(TestCase):
             },
             'youtube-playlist': {
                 'valid': (
+                    'https://m.youtube.com/playlist?list=testplaylist',
+                    'https://m.youtube.com/watch?v=testvideo&list=testplaylist',
                     'https://www.youtube.com/playlist?list=testplaylist',
                     'https://www.youtube.com/watch?v=testvideo&list=testplaylist',
                 ),
@@ -93,6 +107,7 @@ class FrontEndTestCase(TestCase):
                 'invalid_domain': (
                     'https://www.test.com/playlist?list=testplaylist',
                     'https://www.example.com/playlist?list=testplaylist',
+                    'https://n.youtube.com/playlist?list=testplaylist',
                 ),
                 'invalid_path': (
                     'https://www.youtube.com/notplaylist?list=testplaylist',
@@ -157,6 +172,8 @@ class FrontEndTestCase(TestCase):
         response = c.get('/source-add')
         self.assertEqual(response.status_code, 200)
         # Create a new source
+        data_categories = ('sponsor', 'preview',)
+        expected_categories = ['sponsor', 'preview']
         data = {
             'source_type': 'c',
             'key': 'testkey',
@@ -164,6 +181,8 @@ class FrontEndTestCase(TestCase):
             'directory': 'testdirectory',
             'media_format': settings.MEDIA_FORMATSTR_DEFAULT,
             'download_cap': 0,
+            'filter_text': '.*',
+            'filter_seconds_min': True,
             'index_schedule': 3600,
             'delete_old_media': False,
             'days_to_keep': 14,
@@ -172,7 +191,9 @@ class FrontEndTestCase(TestCase):
             'source_acodec': 'OPUS',
             'prefer_60fps': False,
             'prefer_hdr': False,
-            'fallback': 'f'
+            'fallback': 'f',
+            'sponsorblock_categories': data_categories,
+            'sub_langs': 'en',
         }
         response = c.post('/source-add', data)
         self.assertEqual(response.status_code, 302)
@@ -185,6 +206,9 @@ class FrontEndTestCase(TestCase):
         source_uuid = path_parts[1]
         source = Source.objects.get(pk=source_uuid)
         self.assertEqual(str(source.pk), source_uuid)
+        # Check that the SponsorBlock categories were saved
+        self.assertEqual(source.sponsorblock_categories.selected_choices,
+                         expected_categories)
         # Check a task was created to index the media for the new source
         source_uuid = str(source.pk)
         task = Task.objects.get_task('sync.tasks.index_source_task',
@@ -197,6 +221,13 @@ class FrontEndTestCase(TestCase):
         # Check the source detail page loads
         response = c.get(f'/source/{source_uuid}')
         self.assertEqual(response.status_code, 200)
+        # save and refresh the Source
+        source.refresh_from_db()
+        source.save()
+        source.refresh_from_db()
+        # Check that the SponsorBlock categories remain saved
+        self.assertEqual(source.sponsorblock_categories.selected_choices,
+                         expected_categories)
         # Update the source key
         data = {
             'source_type': Source.SOURCE_TYPE_YOUTUBE_CHANNEL,
@@ -205,6 +236,8 @@ class FrontEndTestCase(TestCase):
             'directory': 'testdirectory',
             'media_format': settings.MEDIA_FORMATSTR_DEFAULT,
             'download_cap': 0,
+            'filter_text': '.*',
+            'filter_seconds_min': True,
             'index_schedule': Source.IndexSchedule.EVERY_HOUR,
             'delete_old_media': False,
             'days_to_keep': 14,
@@ -213,7 +246,9 @@ class FrontEndTestCase(TestCase):
             'source_acodec': Source.SOURCE_ACODEC_OPUS,
             'prefer_60fps': False,
             'prefer_hdr': False,
-            'fallback': Source.FALLBACK_FAIL
+            'fallback': Source.FALLBACK_FAIL,
+            'sponsorblock_categories': data_categories,
+            'sub_langs': 'en',
         }
         response = c.post(f'/source-update/{source_uuid}', data)
         self.assertEqual(response.status_code, 302)
@@ -226,6 +261,10 @@ class FrontEndTestCase(TestCase):
         source_uuid = path_parts[1]
         source = Source.objects.get(pk=source_uuid)
         self.assertEqual(source.key, 'updatedkey')
+        # Check that the SponsorBlock categories remain saved
+        source.refresh_from_db()
+        self.assertEqual(source.sponsorblock_categories.selected_choices,
+                         expected_categories)
         # Update the source index schedule which should recreate the scheduled task
         data = {
             'source_type': Source.SOURCE_TYPE_YOUTUBE_CHANNEL,
@@ -234,6 +273,8 @@ class FrontEndTestCase(TestCase):
             'directory': 'testdirectory',
             'media_format': settings.MEDIA_FORMATSTR_DEFAULT,
             'download_cap': 0,
+            'filter_text': '.*',
+            'filter_seconds_min': True,
             'index_schedule': Source.IndexSchedule.EVERY_2_HOURS,  # changed
             'delete_old_media': False,
             'days_to_keep': 14,
@@ -242,7 +283,9 @@ class FrontEndTestCase(TestCase):
             'source_acodec': Source.SOURCE_ACODEC_OPUS,
             'prefer_60fps': False,
             'prefer_hdr': False,
-            'fallback': Source.FALLBACK_FAIL
+            'fallback': Source.FALLBACK_FAIL,
+            'sponsorblock_categories': data_categories,
+            'sub_langs': 'en',
         }
         response = c.post(f'/source-update/{source_uuid}', data)
         self.assertEqual(response.status_code, 302)
@@ -254,6 +297,9 @@ class FrontEndTestCase(TestCase):
         self.assertEqual(path_parts[0], 'source')
         source_uuid = path_parts[1]
         source = Source.objects.get(pk=source_uuid)
+        # Check that the SponsorBlock categories remain saved
+        self.assertEqual(source.sponsorblock_categories.selected_choices,
+                         expected_categories)
         # Check a new task has been created by seeing if the pk has changed
         new_task = Task.objects.get_task('sync.tasks.index_source_task',
                                          args=(source_uuid,))[0]
@@ -454,11 +500,14 @@ metadata_60fps_filepath = settings.BASE_DIR / 'sync' / 'testdata' / 'metadata_60
 metadata_60fps = open(metadata_60fps_filepath, 'rt').read()
 metadata_60fps_hdr_filepath = settings.BASE_DIR / 'sync' / 'testdata' / 'metadata_60fps_hdr.json'
 metadata_60fps_hdr = open(metadata_60fps_hdr_filepath, 'rt').read()
+metadata_20230629_filepath = settings.BASE_DIR / 'sync' / 'testdata' / 'metadata_2023-06-29.json'
+metadata_20230629 = open(metadata_20230629_filepath, 'rt').read()
 all_test_metadata = {
     'boring': metadata,
     'hdr': metadata_hdr,
     '60fps': metadata_60fps,
     '60fps+hdr': metadata_60fps_hdr,
+    '20230629': metadata_20230629,
 }
 
 
@@ -571,11 +620,11 @@ class FilepathTestCase(TestCase):
         # Check child directories work
         self.source.media_format = '{yyyy}/{key}.{ext}'
         self.assertEqual(self.media.directory_path,
-                         str(self.source.directory_path / '2017'))
+                         self.source.directory_path / '2017')
         self.assertEqual(self.media.filename, '2017/mediakey.mkv')
         self.source.media_format = '{yyyy}/{yyyy_mm_dd}/{key}.{ext}'
         self.assertEqual(self.media.directory_path,
-                         str(self.source.directory_path / '2017/2017-09-11'))
+                         self.source.directory_path / '2017/2017-09-11')
         self.assertEqual(self.media.filename, '2017/2017-09-11/mediakey.mkv')
         # Check media specific media format keys work
         test_media = Media.objects.create(
@@ -601,6 +650,25 @@ class FilepathTestCase(TestCase):
         self.assertEqual(test_media.filename,
                          ('no-fancy-stuff-title_test_720p-720x1280-opus'
                           '-vp9-30fps-hdr.mkv'))
+
+    def test_directory_prefix(self):
+        # Confirm the setting exists and is valid
+        self.assertTrue(hasattr(settings, 'SOURCE_DOWNLOAD_DIRECTORY_PREFIX'))
+        self.assertTrue(isinstance(settings.SOURCE_DOWNLOAD_DIRECTORY_PREFIX, bool))
+        # Test the default behavior for "True", forced "audio" or "video" parent directories for sources
+        settings.SOURCE_DOWNLOAD_DIRECTORY_PREFIX = True
+        self.source.source_resolution = Source.SOURCE_RESOLUTION_AUDIO
+        test_audio_prefix_path = Path(self.source.directory_path)
+        self.assertEqual(test_audio_prefix_path.parts[-2], 'audio')
+        self.assertEqual(test_audio_prefix_path.parts[-1], 'testdirectory')
+        self.source.source_resolution = Source.SOURCE_RESOLUTION_1080P
+        test_video_prefix_path = Path(self.source.directory_path)
+        self.assertEqual(test_video_prefix_path.parts[-2], 'video')
+        self.assertEqual(test_video_prefix_path.parts[-1], 'testdirectory')
+        # Test the default behavior for "False", no parent directories for sources
+        settings.SOURCE_DOWNLOAD_DIRECTORY_PREFIX = False
+        test_no_prefix_path = Path(self.source.directory_path)
+        self.assertEqual(test_no_prefix_path.parts[-1], 'testdirectory')
 
 
 class MediaTestCase(TestCase):
@@ -641,6 +709,8 @@ class MediaTestCase(TestCase):
             '<episodedetails>',
             '  <title>no fancy stuff title</title>',
             '  <showtitle>testname</showtitle>',
+            '  <season>2017</season>',
+            '  <episode></episode>',
             '  <ratings>',
             '    <rating default="True" max="5" name="youtube">',
             '      <value>1.2345</value>',
@@ -674,6 +744,176 @@ class MediaTestCase(TestCase):
             self.assertEqual(expected_node.text, nfo_node.text)
 
 
+class MediaFilterTestCase(TestCase):
+
+    def setUp(self):
+        # Disable general logging for test case
+        # logging.disable(logging.CRITICAL)
+        # Add a test source
+        self.source = Source.objects.create(
+            source_type=Source.SOURCE_TYPE_YOUTUBE_CHANNEL,
+            key="testkey",
+            name="testname",
+            directory="testdirectory",
+            media_format=settings.MEDIA_FORMATSTR_DEFAULT,
+            index_schedule=3600,
+            delete_old_media=False,
+            days_to_keep=14,
+            source_resolution=Source.SOURCE_RESOLUTION_1080P,
+            source_vcodec=Source.SOURCE_VCODEC_VP9,
+            source_acodec=Source.SOURCE_ACODEC_OPUS,
+            prefer_60fps=False,
+            prefer_hdr=False,
+            fallback=Source.FALLBACK_FAIL,
+        )
+        # Add some test media
+        self.media = Media.objects.create(
+            key="mediakey",
+            source=self.source,
+            metadata=metadata,
+            skip=False,
+            published=timezone.make_aware(
+                datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+            ),
+        )
+        # Fix a created datetime for predictable testing
+        self.media.created = datetime(
+            year=2020, month=1, day=1, hour=1, minute=1, second=1
+        )
+
+    def test_filter_unpublished_skip(self):
+        # Check if unpublished that we skip download it
+        self.media.skip = False
+        self.media.published = False
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertTrue(self.media.skip)
+
+    def test_filter_published_unskip(self):
+        # Check if we had previously skipped it, but now it's published, we won't skip it
+        self.media.skip = True
+        self.media.published = timezone.make_aware(
+            datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+        )
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertFalse(self.media.skip)
+
+    def test_filter_filter_text_nomatch(self):
+        # Check that if we don't match the filter text, we skip
+        self.media.source.filter_text = "No fancy stuff"
+        self.media.skip = False
+        self.media.published = timezone.make_aware(
+            datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+        )
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertTrue(self.media.skip)
+
+    def test_filter_filter_text_match(self):
+        # Check that if we match the filter text, we don't skip
+        self.media.source.filter_text = "(?i)No fancy stuff"
+        self.media.skip = True
+        self.media.published = timezone.make_aware(
+            datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+        )
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertFalse(self.media.skip)
+
+    def test_filter_filter_text_invert_nomatch(self):
+        # Check that if we don't match the filter text, we don't skip
+        self.media.source.filter_text = "No fancy stuff"
+        self.media.source.filter_text_invert = True
+        self.media.skip = True
+        self.media.published = timezone.make_aware(
+            datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+        )
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertFalse(self.media.skip)
+
+    def test_filter_filter_text_invert_match(self):
+        # Check that if we match the filter text and do skip
+        self.media.source.filter_text = "(?i)No fancy stuff"
+        self.media.source.filter_text_invert = True
+        self.media.skip = False
+        self.media.published = timezone.make_aware(
+            datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+        )
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertTrue(self.media.skip)
+
+    def test_filter_max_cap_skip(self):
+        # Check if it's older than the max_cap, we don't download it (1 second so it will always fail)
+        self.media.source.download_cap = 1
+        self.media.skip = False
+        self.media.published = timezone.make_aware(
+            datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+        )
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertTrue(self.media.skip)
+
+    def test_filter_max_cap_unskip(self):
+        # Make sure it's newer than the cap so we download it, ensure that we are published in the last seconds
+        self.media.source.download_cap = 3600
+        self.media.skip = True
+        self.media.published = timezone.now()
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertFalse(self.media.skip)
+
+    def test_filter_below_min(self):
+        # Filter videos shorter than the minimum limit
+        self.media.skip = False
+        self.media.source.filter_seconds_min = True
+        self.media.source.filter_seconds = 500
+        self.media.published = timezone.make_aware(
+            datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+        )
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertTrue(self.media.skip)
+
+    def test_filter_above_min(self):
+        # Video is longer than the minimum, allow it
+        self.media.skip = True
+        self.media.source.filter_seconds_min = True
+        self.media.source.filter_seconds = 300
+        self.media.published = timezone.make_aware(
+            datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+        )
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertFalse(self.media.skip)
+
+    def test_filter_above_max(self):
+        # Filter videos longer than the maximum limit
+        self.media.skip = False
+        self.media.source.filter_seconds_min = False
+        self.media.source.filter_seconds = 300
+        self.media.published = timezone.make_aware(
+            datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+        )
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertTrue(self.media.skip)
+
+    def test_filter_below_max(self):
+        # Video is below the maximum, allow it
+        self.media.skip = True
+        self.media.source.filter_seconds_min = False
+        self.media.source.filter_seconds = 500
+        self.media.published = timezone.make_aware(
+            datetime(year=2020, month=1, day=1, hour=1, minute=1, second=1)
+        )
+        changed = filter_media(self.media)
+        self.assertTrue(changed)
+        self.assertFalse(self.media.skip)
+
+
 class FormatMatchingTestCase(TestCase):
 
     def setUp(self):
@@ -705,6 +945,7 @@ class FormatMatchingTestCase(TestCase):
     def test_combined_exact_format_matching(self):
         self.source.fallback = Source.FALLBACK_FAIL
         self.media.metadata = all_test_metadata['boring']
+        self.media.save()
         expected_matches = {
             # (format, vcodec, acodec, prefer_60fps, prefer_hdr): (match_type, code),
             ('360p', 'AVC1', 'MP4A', True, False): (False, False),
@@ -821,7 +1062,7 @@ class FormatMatchingTestCase(TestCase):
         }
         for params, expected in expected_matches.items():
             resolution, vcodec, acodec, prefer_60fps, prefer_hdr = params
-            expeceted_match_type, expected_format_code = expected
+            expected_match_type, expected_format_code = expected
             self.source.source_resolution = resolution
             self.source.source_vcodec = vcodec
             self.source.source_acodec = acodec
@@ -829,11 +1070,12 @@ class FormatMatchingTestCase(TestCase):
             self.source.prefer_hdr = prefer_hdr
             match_type, format_code = self.media.get_best_combined_format()
             self.assertEqual(format_code, expected_format_code)
-            self.assertEqual(match_type, expeceted_match_type)
+            self.assertEqual(match_type, expected_match_type)
 
     def test_audio_exact_format_matching(self):
         self.source.fallback = Source.FALLBACK_FAIL
         self.media.metadata = all_test_metadata['boring']
+        self.media.save()
         expected_matches = {
             # (format, vcodec, acodec, prefer_60fps, prefer_hdr): (match_type, code),
             ('360p', 'AVC1', 'MP4A', True, False): (True, '140'),
@@ -980,6 +1222,7 @@ class FormatMatchingTestCase(TestCase):
         self.source.fallback = Source.FALLBACK_FAIL
         # Test no 60fps, no HDR metadata
         self.media.metadata = all_test_metadata['boring']
+        self.media.save()
         expected_matches = {
             # (format, vcodec, prefer_60fps, prefer_hdr): (match_type, code),
             ('360p', 'AVC1', False, True): (False, False),
@@ -1027,6 +1270,7 @@ class FormatMatchingTestCase(TestCase):
             self.assertEqual(match_type, expeceted_match_type)
         # Test 60fps metadata
         self.media.metadata = all_test_metadata['60fps']
+        self.media.save()
         expected_matches = {
             # (format, vcodec, prefer_60fps, prefer_hdr): (match_type, code),
             ('360p', 'AVC1', False, True): (False, False),
@@ -1066,6 +1310,7 @@ class FormatMatchingTestCase(TestCase):
             self.assertEqual(match_type, expeceted_match_type)
         # Test hdr metadata
         self.media.metadata = all_test_metadata['hdr']
+        self.media.save()
         expected_matches = {
             # (format, vcodec, prefer_60fps, prefer_hdr): (match_type, code),
             ('360p', 'AVC1', False, True): (False, False),
@@ -1121,6 +1366,7 @@ class FormatMatchingTestCase(TestCase):
             self.assertEqual(match_type, expeceted_match_type)
         # Test 60fps+hdr metadata
         self.media.metadata = all_test_metadata['60fps+hdr']
+        self.media.save()
         expected_matches = {
             # (format, vcodec, prefer_60fps, prefer_hdr): (match_type, code),
             ('360p', 'AVC1', False, True): (False, False),
@@ -1186,6 +1432,7 @@ class FormatMatchingTestCase(TestCase):
         self.source.fallback = Source.FALLBACK_NEXT_BEST
         # Test no 60fps, no HDR metadata
         self.media.metadata = all_test_metadata['boring']
+        self.media.save()
         expected_matches = {
             # (format, vcodec, prefer_60fps, prefer_hdr): (match_type, code),
             ('360p', 'AVC1', False, True): (False, '134'),             # Fallback match, no hdr
@@ -1233,6 +1480,7 @@ class FormatMatchingTestCase(TestCase):
             self.assertEqual(match_type, expeceted_match_type)
         # Test 60fps metadata
         self.media.metadata = all_test_metadata['60fps']
+        self.media.save()
         expected_matches = {
             # (format, vcodec, prefer_60fps, prefer_hdr): (match_type, code),
             ('360p', 'AVC1', False, True): (False, '134'),             # Fallback match, no hdr
@@ -1272,6 +1520,7 @@ class FormatMatchingTestCase(TestCase):
             self.assertEqual(match_type, expeceted_match_type)
         # Test hdr metadata
         self.media.metadata = all_test_metadata['hdr']
+        self.media.save()
         expected_matches = {
             # (format, vcodec, prefer_60fps, prefer_hdr): (match_type, code),
             ('360p', 'AVC1', False, True): (False, '332'),             # Fallback match, hdr, switched to VP9
@@ -1327,6 +1576,7 @@ class FormatMatchingTestCase(TestCase):
             self.assertEqual(match_type, expeceted_match_type)
         # Test 60fps+hdr metadata
         self.media.metadata = all_test_metadata['60fps+hdr']
+        self.media.save()
         expected_matches = {
             # (format, vcodec, prefer_60fps, prefer_hdr): (match_type, code),
             ('360p', 'AVC1', False, True): (False, '134'),             # Fallback match, no hdr
@@ -1387,3 +1637,205 @@ class FormatMatchingTestCase(TestCase):
             match_type, format_code = self.media.get_best_video_format()
             self.assertEqual(format_code, expected_format_code)
             self.assertEqual(match_type, expeceted_match_type)
+
+    def test_metadata_20230629(self):
+        self.media.metadata = all_test_metadata['20230629']
+        self.media.save()
+        expected_matches = {
+            # (format, vcodec, prefer_60fps, prefer_hdr): (match_type, code),
+            ('360p', 'AVC1', False, True): (False, '134'),             # Fallback match, no hdr
+            ('360p', 'AVC1', True, False): (False, '134'),             # Fallback match, no 60fps
+            ('360p', 'AVC1', True, True): (False, '332'),              # Fallback match, 60fps+hdr, switched to VP9
+            ('360p', 'VP9', False, False): (True, '243'),              # Exact match
+            ('360p', 'VP9', False, True): (True, '332'),               # Exact match, hdr
+            ('360p', 'VP9', True, False): (False, '332'),              # Fallback match, 60fps, extra hdr
+            ('360p', 'VP9', True, True): (True, '332'),                # Exact match, 60fps+hdr
+            ('480p', 'AVC1', False, False): (True, '135'),             # Exact match
+            ('480p', 'AVC1', False, True): (False, '135'),             # Fallback match, no hdr
+            ('480p', 'AVC1', True, False): (False, '135'),             # Fallback match, no 60fps
+            ('480p', 'AVC1', True, True): (False, '333'),              # Fallback match, 60fps+hdr, switched to VP9
+            ('480p', 'VP9', False, False): (True, '244'),              # Exact match
+            ('480p', 'VP9', False, True): (True, '333'),               # Exact match, hdr
+            ('480p', 'VP9', True, False): (False, '333'),              # Fallback match, 60fps, extra hdr
+            ('480p', 'VP9', True, True): (True, '333'),                # Exact match, 60fps+hdr
+            ('720p', 'AVC1', False, False): (True, '136'),             # Exact match
+            ('720p', 'AVC1', False, True): (False, '136'),             # Fallback match, no hdr
+            ('720p', 'AVC1', True, False): (True, '298'),              # Exact match, 60fps
+            ('720p', 'AVC1', True, True): (False, '334'),              # Fallback match, 60fps+hdr, switched to VP9
+            ('720p', 'VP9', False, False): (True, '247'),              # Exact match
+            ('720p', 'VP9', False, True): (True, '334'),               # Exact match, hdr
+            ('720p', 'VP9', True, False): (True, '302'),               # Exact match, 60fps
+            ('720p', 'VP9', True, True): (True, '334'),                # Exact match, 60fps+hdr
+            ('1440p', 'AVC1', False, False): (False, '308'),           # Fallback match, 60fps, switched to VP9 (no 1440p AVC1)
+            ('1440p', 'AVC1', False, True): (False, '336'),            # Fallback match, 60fps+hdr, switched to VP9 (no 1440p AVC1)
+            ('1440p', 'AVC1', True, False): (False, '308'),            # Fallback match, 60fps, switched to VP9 (no 1440p AVC1)
+            ('1440p', 'AVC1', True, True): (False, '336'),             # Fallback match, 60fps+hdr, switched to VP9 (no 1440p AVC1)
+            ('1440p', 'VP9', False, False): (False, '308'),            # Fallback, 60fps
+            ('1440p', 'VP9', False, True): (True, '336'),              # Exact match, hdr
+            ('1440p', 'VP9', True, False): (True, '308'),              # Exact match, 60fps
+            ('1440p', 'VP9', True, True): (True, '336'),               # Exact match, 60fps+hdr
+            ('2160p', 'AVC1', False, False): (False, '315'),           # Fallback, 60fps, switched to VP9 (no 2160p AVC1)
+            ('2160p', 'AVC1', False, True): (False, '337'),            # Fallback match, 60fps+hdr, switched to VP9 (no 2160p AVC1)
+            ('2160p', 'AVC1', True, False): (False, '315'),            # Fallback, switched to VP9 (no 2160p AVC1)
+            ('2160p', 'AVC1', True, True): (False, '337'),             # Fallback match, 60fps+hdr, switched to VP9 (no 2160p AVC1)
+            ('2160p', 'VP9', False, False): (False, '315'),            # Fallback, 60fps
+            ('2160p', 'VP9', False, True): (True, '337'),              # Exact match, hdr
+            ('2160p', 'VP9', True, False): (True, '315'),              # Exact match, 60fps
+            ('2160p', 'VP9', True, True): (True, '337'),               # Exact match, 60fps+hdr
+            ('4320p', 'AVC1', False, False): (False, '272'),           # Fallback, 60fps, switched to VP9 (no 4320p AVC1, no other 8k streams)
+            ('4320p', 'AVC1', False, True): (False, '272'),            # Fallback, 60fps, switched to VP9 (no 4320p AVC1, no other 8k streams)
+            ('4320p', 'AVC1', True, False): (False, '272'),            # Fallback, 60fps, switched to VP9 (no 4320p AVC1, no other 8k streams)
+            ('4320p', 'AVC1', True, True): (False, '272'),             # Fallback, 60fps, switched to VP9 (no 4320p AVC1, no other 8k streams)
+            ('4320p', 'VP9', False, False): (False, '272'),            # Fallback, 60fps (no other 8k streams)
+            ('4320p', 'VP9', False, True): (False, '272'),             # Fallback, 60fps (no other 8k streams)
+            ('4320p', 'VP9', True, False): (True, '272'),              # Exact match, 60fps
+            ('4320p', 'VP9', True, True): (False, '272'),              # Fallback, 60fps (no other 8k streams)
+        }
+        for params, expected in expected_matches.items():
+            resolution, vcodec, prefer_60fps, prefer_hdr = params
+            expeceted_match_type, expected_format_code = expected
+            self.source.source_resolution = resolution
+            self.source.source_vcodec = vcodec
+            self.source.prefer_60fps = prefer_60fps
+            self.source.prefer_hdr = prefer_hdr
+            # The aim here is to execute the matching code to find error paths, specific testing isn't required
+            self.media.get_best_video_format()
+            self.media.get_best_audio_format()
+
+    def test_is_regex_match(self):
+
+        self.media.metadata = all_test_metadata['boring']
+        self.media.save()
+        expected_matches = {
+            ('.*'): (True),
+            ('no fancy stuff'): (True),
+            ('No fancy stuff'): (False),
+            ('(?i)No fancy stuff'): (True), #set case insensitive flag
+            ('no'): (True),
+            ('Foo'): (False),
+            ('^(?!.*fancy).*$'): (False),
+            ('^(?!.*funny).*$'): (True),
+            ('(?=.*f.*)(?=.{0,2}|.{4,})'): (True),
+            ('f{4,}'): (False),
+            ('^[^A-Z]*$'): (True),
+            ('^[^a-z]*$'): (False),
+            ('^[^\\s]*$'): (False)
+        }
+
+        for params, expected in expected_matches.items():
+            self.source.filter_text = params
+            expected_match_result = expected
+            self.assertEqual(
+                self.source.is_regex_match(self.media.title),
+                expected_match_result,
+                msg=f'Media title "{self.media.title}" checked against regex "{self.source.filter_text}" failed '
+                    f'expected {expected_match_result}')
+
+
+class ResponseFilteringTestCase(TestCase):
+
+    def setUp(self):
+        # Disable general logging for test case
+        logging.disable(logging.CRITICAL)
+        # Add a test source
+        self.source = Source.objects.create(
+            source_type=Source.SOURCE_TYPE_YOUTUBE_CHANNEL,
+            key='testkey',
+            name='testname',
+            directory='testdirectory',
+            index_schedule=3600,
+            delete_old_media=False,
+            days_to_keep=14,
+            source_resolution=Source.SOURCE_RESOLUTION_1080P,
+            source_vcodec=Source.SOURCE_VCODEC_VP9,
+            source_acodec=Source.SOURCE_ACODEC_OPUS,
+            prefer_60fps=False,
+            prefer_hdr=False,
+            fallback=Source.FALLBACK_FAIL
+        )
+        # Add some media
+        self.media = Media.objects.create(
+            key='mediakey',
+            source=self.source,
+            metadata='{}'
+        )
+
+    @override_settings(SHRINK_OLD_MEDIA_METADATA=False, SHRINK_NEW_MEDIA_METADATA=False)
+    def test_metadata_20230629(self):
+        self.media.metadata = all_test_metadata['20230629']
+        self.media.save()
+
+        unfiltered = self.media.loaded_metadata
+        filtered = filter_response(self.media.loaded_metadata)
+        self.assertIn('formats', unfiltered.keys())
+        self.assertIn('formats', filtered.keys())
+        # filtered 'downloader_options'
+        self.assertIn('downloader_options', unfiltered['formats'][10].keys())
+        self.assertNotIn('downloader_options', filtered['formats'][10].keys())
+        # filtered 'http_headers'
+        self.assertIn('http_headers', unfiltered['formats'][0].keys())
+        self.assertNotIn('http_headers', filtered['formats'][0].keys())
+        # did not lose any formats
+        self.assertEqual(48, len(unfiltered['formats']))
+        self.assertEqual(48, len(filtered['formats']))
+        self.assertEqual(len(unfiltered['formats']), len(filtered['formats']))
+        # did not remove everything with url
+        self.assertIn('original_url', unfiltered.keys())
+        self.assertIn('original_url', filtered.keys())
+        self.assertEqual(unfiltered['original_url'], filtered['original_url'])
+        # did reduce the size of the metadata
+        self.assertTrue(len(str(filtered)) < len(str(unfiltered)))
+
+        url_keys = []
+        for format in unfiltered['formats']:
+            for key in format.keys():
+                if 'url' in key:
+                    url_keys.append((format['format_id'], key, format[key],))
+        unfiltered_url_keys = url_keys
+        self.assertEqual(63, len(unfiltered_url_keys), msg=str(unfiltered_url_keys))
+
+        url_keys = []
+        for format in filtered['formats']:
+            for key in format.keys():
+                if 'url' in key:
+                    url_keys.append((format['format_id'], key, format[key],))
+        filtered_url_keys = url_keys
+        self.assertEqual(3, len(filtered_url_keys), msg=str(filtered_url_keys))
+
+        url_keys = []
+        for lang_code, captions in filtered['automatic_captions'].items():
+            for caption in captions:
+                for key in caption.keys():
+                    if 'url' in key:
+                        url_keys.append((lang_code, caption['ext'], caption[key],))
+        self.assertEqual(0, len(url_keys), msg=str(url_keys))
+
+
+class TasksTestCase(TestCase):
+
+    def setUp(self):
+        # Disable general logging for test case
+        logging.disable(logging.CRITICAL)
+
+    def test_delete_old_media(self):
+        src1 = Source.objects.create(key='aaa', name='aaa', directory='/tmp/a', delete_old_media=False, days_to_keep=14)
+        src2 = Source.objects.create(key='bbb', name='bbb', directory='/tmp/b', delete_old_media=True, days_to_keep=14)
+
+        now = timezone.now()
+
+        m11 = Media.objects.create(source=src1, downloaded=True, key='a11', download_date=now - timedelta(days=5))
+        m12 = Media.objects.create(source=src1, downloaded=True, key='a12', download_date=now - timedelta(days=25))
+        m13 = Media.objects.create(source=src1, downloaded=False, key='a13')
+
+        m21 = Media.objects.create(source=src2, downloaded=True, key='a21', download_date=now - timedelta(days=5))
+        m22 = Media.objects.create(source=src2, downloaded=True, key='a22', download_date=now - timedelta(days=25))
+        m23 = Media.objects.create(source=src2, downloaded=False, key='a23')
+
+        self.assertEqual(src1.media_source.all().count(), 3)
+        self.assertEqual(src2.media_source.all().count(), 3)
+
+        cleanup_old_media()
+
+        self.assertEqual(src1.media_source.all().count(), 3)
+        self.assertEqual(src2.media_source.all().count(), 2)
+        self.assertEqual(Media.objects.filter(pk=m22.pk).exists(), False)

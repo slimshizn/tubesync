@@ -2,7 +2,7 @@ from django.urls import path
 from .views import (DashboardView, SourcesView, ValidateSourceView, AddSourceView,
                     SourceView, UpdateSourceView, DeleteSourceView, MediaView,
                     MediaThumbView, MediaItemView, MediaRedownloadView, MediaSkipView,
-                    MediaEnableView, TasksView, CompletedTasksView, ResetTasks,
+                    MediaEnableView, MediaContent, TasksView, CompletedTasksView, ResetTasks,
                     MediaServersView, AddMediaServerView, MediaServerView,
                     DeleteMediaServerView, UpdateMediaServerView)
 
@@ -17,7 +17,7 @@ urlpatterns = [
     path('',
          DashboardView.as_view(),
          name='dashboard'),
-    
+
     # Source URLs
 
     path('sources',
@@ -27,6 +27,10 @@ urlpatterns = [
     path('source-validate/<slug:source_type>',
          ValidateSourceView.as_view(),
          name='validate-source'),
+
+    path('source-sync-now/<uuid:pk>',
+         SourcesView.as_view(),
+         name='source-sync-now'),
 
     path('source-add',
          AddSourceView.as_view(),
@@ -69,6 +73,10 @@ urlpatterns = [
     path('media-enable/<uuid:pk>',
          MediaEnableView.as_view(),
          name='enable-media'),
+
+    path('media-content/<uuid:pk>',
+         MediaContent.as_view(),
+         name='media-content'),
 
     # Task URLs
 

@@ -14,6 +14,7 @@ from datetime import timedelta, datetime
 from shutil import copyfile
 from PIL import Image
 from django.conf import settings
+from django.core.files.base import ContentFile
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
 from django.db.utils import IntegrityError
@@ -25,7 +26,8 @@ from common.errors import NoMediaException, DownloadFailedException
 from common.utils import json_serial
 from .models import Source, Media, MediaServer
 from .utils import (get_remote_image, resize_image_to_height, delete_file,
-                    write_text_file)
+                    write_text_file, filter_response)
+from .filtering import filter_media
 
 
 def get_hash(task_name, pk):
@@ -47,6 +49,9 @@ def map_task_to_instance(task):
         'sync.tasks.check_source_directory_exists': Source,
         'sync.tasks.download_media_thumbnail': Media,
         'sync.tasks.download_media': Media,
+        'sync.tasks.download_media_metadata': Media,
+        'sync.tasks.save_all_media_for_source': Source,
+        'sync.tasks.rename_all_media_for_source': Source,
     }
     MODEL_URL_MAP = {
         Source: 'sync:source',
@@ -114,6 +119,12 @@ def get_media_download_task(media_id):
     except IndexError:
         return False
 
+def get_media_metadata_task(media_id):
+    try:
+        return Task.objects.get_task('sync.tasks.download_media_metadata',
+                                     args=(str(media_id),))[0]
+    except IndexError:
+        return False
 
 def delete_task_by_source(task_name, source_id):
     return Task.objects.filter(task_name=task_name, queue=str(source_id)).delete()
@@ -132,16 +143,23 @@ def cleanup_completed_tasks():
 
 
 def cleanup_old_media():
-    for media in Media.objects.filter(download_date__isnull=False):
-        if media.source.delete_old_media and media.source.days_to_keep > 0:
-            delta = timezone.now() - timedelta(days=media.source.days_to_keep)
-            if media.downloaded and media.download_date < delta:
-                # Media was downloaded after the cutoff date, delete it
-                log.info(f'Deleting expired media: {media.source} / {media} '
-                         f'(now older than {media.source.days_to_keep} days / '
-                         f'download_date before {delta})')
-                # .delete() also triggers a pre_delete signal that removes the files
-                media.delete()
+    for source in Source.objects.filter(delete_old_media=True, days_to_keep__gt=0):
+        delta = timezone.now() - timedelta(days=source.days_to_keep)
+        for media in source.media_source.filter(downloaded=True, download_date__lt=delta):
+            log.info(f'Deleting expired media: {source} / {media} '
+                     f'(now older than {source.days_to_keep} days / '
+                     f'download_date before {delta})')
+            # .delete() also triggers a pre_delete signal that removes the files
+            media.delete()
+
+
+def cleanup_removed_media(source, videos):
+    media_objects = Media.objects.filter(source=source)
+    for media in media_objects:
+        matching_source_item = [video['id'] for video in videos if video['id'] == media.key]
+        if not matching_source_item:
+            log.info(f'{media.name} is no longer in source, removing')
+            media.delete()
 
 
 @background(schedule=0)
@@ -153,7 +171,6 @@ def index_source_task(source_id):
         source = Source.objects.get(pk=source_id)
     except Source.DoesNotExist:
         # Task triggered but the Source has been deleted, delete the task
-        delete_index_source_task(source_id)
         return
     # Reset any errors
     source.has_failed = False
@@ -182,13 +199,24 @@ def index_source_task(source_id):
         media.source = source
         try:
             media.save()
-            log.info(f'Indexed media: {source} / {media}')
+            log.debug(f'Indexed media: {source} / {media}')
+            # log the new media instances
+            new_media_instance = (
+                media.created and
+                source.last_crawl and
+                media.created >= source.last_crawl
+            )
+            if new_media_instance:
+                log.info(f'Indexed new media: {source} / {media}')
         except IntegrityError as e:
             log.error(f'Index media failed: {source} / {media} with "{e}"')
     # Tack on a cleanup of old completed tasks
     cleanup_completed_tasks()
     # Tack on a cleanup of old media
     cleanup_old_media()
+    if source.delete_removed_media:
+        log.info(f'Cleaning up media no longer in source: {source}')
+        cleanup_removed_media(source, videos)
 
 
 @background(schedule=0)
@@ -202,13 +230,62 @@ def check_source_directory_exists(source_id):
         source = Source.objects.get(pk=source_id)
     except Source.DoesNotExist:
         # Task triggered but the Source has been deleted, delete the task
-        delete_index_source_task(source_id)
         return
     # Check the source output directory exists
     if not source.directory_exists():
         # Try and create it
         log.info(f'Creating directory: {source.directory_path}')
         source.make_directory()
+
+
+@background(schedule=0)
+def download_source_images(source_id):
+    '''
+        Downloads an image and save it as a local thumbnail attached to a
+        Source instance.
+    '''
+    try:
+        source = Source.objects.get(pk=source_id)
+    except Source.DoesNotExist:
+        # Task triggered but the source no longer exists, do nothing
+        log.error(f'Task download_source_images(pk={source_id}) called but no '
+                  f'source exists with ID: {source_id}')
+        return
+    avatar, banner = source.get_image_url
+    log.info(f'Thumbnail URL for source with ID: {source_id} / {source} '
+        f'Avatar: {avatar} '
+        f'Banner: {banner}')
+    if banner != None:
+        url = banner
+        i = get_remote_image(url)
+        image_file = BytesIO()
+        i.save(image_file, 'JPEG', quality=85, optimize=True, progressive=True)
+
+        for file_name in ["banner.jpg", "background.jpg"]:
+            # Reset file pointer to the beginning for the next save
+            image_file.seek(0)
+            # Create a Django ContentFile from BytesIO stream
+            django_file = ContentFile(image_file.read())
+            file_path = source.directory_path / file_name
+            with open(file_path, 'wb') as f:
+                f.write(django_file.read())
+
+    if avatar != None:
+        url = avatar
+        i = get_remote_image(url)
+        image_file = BytesIO()
+        i.save(image_file, 'JPEG', quality=85, optimize=True, progressive=True)
+
+        for file_name in ["poster.jpg", "season-poster.jpg"]:
+            # Reset file pointer to the beginning for the next save
+            image_file.seek(0)
+            # Create a Django ContentFile from BytesIO stream
+            django_file = ContentFile(image_file.read())
+            file_path = source.directory_path / file_name
+            with open(file_path, 'wb') as f:
+                f.write(django_file.read())
+
+    log.info(f'Thumbnail downloaded for source with ID: {source_id} / {source}')
 
 
 @background(schedule=0)
@@ -223,47 +300,32 @@ def download_media_metadata(media_id):
         log.error(f'Task download_media_metadata(pk={media_id}) called but no '
                   f'media exists with ID: {media_id}')
         return
+    if media.manual_skip:
+        log.info(f'Task for ID: {media_id} / {media} skipped, due to task being manually skipped.')
+        return
     source = media.source
     metadata = media.index_metadata()
-    media.metadata = json.dumps(metadata, default=json_serial)
+    response = metadata
+    if getattr(settings, 'SHRINK_NEW_MEDIA_METADATA', False):
+        response = filter_response(metadata, True)
+    media.metadata = json.dumps(response, separators=(',', ':'), default=json_serial)
     upload_date = media.upload_date
     # Media must have a valid upload date
     if upload_date:
         media.published = timezone.make_aware(upload_date)
-    else:
-        log.error(f'Media has no upload date, skipping: {source} / {media}')
-        media.skip = True
-    # If the source has a download cap date check the upload date is allowed
-    max_cap_age = source.download_cap_date
-    if media.published and max_cap_age:
-        if media.published < max_cap_age:
-            # Media was published after the cap date, skip it
-            log.warn(f'Media: {source} / {media} is older than cap age '
-                     f'{max_cap_age}, skipping')
-            media.skip = True
-    # If the source has a cut-off check the upload date is within the allowed delta
-    if source.delete_old_media and source.days_to_keep > 0:
-        if not isinstance(media.published, datetime):
-            # Media has no known published date or incomplete metadata
-            log.warn(f'Media: {source} / {media} has no published date, skipping')
-            media.skip = True
-        else:
-            delta = timezone.now() - timedelta(days=source.days_to_keep)
-            if media.published < delta:
-                # Media was published after the cutoff date, skip it
-                log.warn(f'Media: {source} / {media} is older than '
-                         f'{source.days_to_keep} days, skipping')
-                media.skip = True
-    # Check we can download the media item
-    if not media.skip:
-        if media.get_format_str():
-            media.can_download = True
-        else:
-            media.can_download = False
-    # Save the media
+
+    # Store title in DB so it's fast to access
+    if media.metadata_title:
+        media.title = media.metadata_title[:200]
+
+    # Store duration in DB so it's fast to access
+    if media.metadata_duration:
+        media.duration = media.metadata_duration
+
+    # Don't filter media here, the post_save signal will handle that
     media.save()
     log.info(f'Saved {len(media.metadata)} bytes of metadata for: '
-             f'{source} / {media_id}')
+             f'{source} / {media}: {media_id}')
 
 
 @background(schedule=0)
@@ -276,6 +338,11 @@ def download_media_thumbnail(media_id, url):
         media = Media.objects.get(pk=media_id)
     except Media.DoesNotExist:
         # Task triggered but the media no longer exists, do nothing
+        return
+    if media.skip:
+        # Media was toggled to be skipped after the task was scheduled
+        log.warn(f'Download task triggered for media: {media} (UUID: {media.pk}) but '
+                 f'it is now marked to be skipped, not downloading thumbnail')
         return
     width = getattr(settings, 'MEDIA_THUMBNAIL_WIDTH', 430)
     height = getattr(settings, 'MEDIA_THUMBNAIL_HEIGHT', 240)
@@ -311,10 +378,10 @@ def download_media(media_id):
         return
     if media.skip:
         # Media was toggled to be skipped after the task was scheduled
-        log.warn(f'Download task triggered for  media: {media} (UUID: {media.pk}) but '
+        log.warn(f'Download task triggered for media: {media} (UUID: {media.pk}) but '
                  f'it is now marked to be skipped, not downloading')
         return
-    if media.downloaded and media.media_file:
+    if media.downloaded and media.media_file and media.media_file.name:
         # Media has been marked as downloaded before the download_media task was fired,
         # skip it
         log.warn(f'Download task triggered for media: {media} (UUID: {media.pk}) but '
@@ -341,7 +408,7 @@ def download_media(media_id):
         log.info(f'Successfully downloaded media: {media} (UUID: {media.pk}) to: '
                  f'"{filepath}"')
         # Link the media file to the object and update info about the download
-        media.media_file.name = str(filepath)
+        media.media_file.name = str(media.source.type_directory_path / media.filename)
         media.downloaded = True
         media.download_date = timezone.now()
         media.downloaded_filesize = os.path.getsize(filepath)
@@ -376,14 +443,26 @@ def download_media(media_id):
                 media.downloaded_format = 'audio'
         media.save()
         # If selected, copy the thumbnail over as well
-        if media.source.copy_thumbnails and media.thumb:
-            log.info(f'Copying media thumbnail from: {media.thumb.path} '
-                     f'to: {media.thumbpath}')
-            copyfile(media.thumb.path, media.thumbpath)
+        if media.source.copy_thumbnails:
+            if not media.thumb_file_exists:
+                thumbnail_url = media.thumbnail
+                if thumbnail_url:
+                    args = ( str(media.pk), thumbnail_url, )
+                    delete_task_by_media('sync.tasks.download_media_thumbnail', args)
+                    if download_media_thumbnail.now(*args):
+                        media.refresh_from_db()
+            if media.thumb_file_exists:
+                log.info(f'Copying media thumbnail from: {media.thumb.path} '
+                         f'to: {media.thumbpath}')
+                copyfile(media.thumb.path, media.thumbpath)
         # If selected, write an NFO file
         if media.source.write_nfo:
-            log.info(f'Writing media NFO file to: to: {media.nfopath}')
-            write_text_file(media.nfopath, media.nfoxml)
+            log.info(f'Writing media NFO file to: {media.nfopath}')
+            try:
+                write_text_file(media.nfopath, media.nfoxml)
+            except PermissionError as e:
+                log.warn(f'A permissions problem occured when writing the new media NFO file: {e.msg}')
+                pass
         # Schedule a task to update media servers
         for mediaserver in MediaServer.objects.all():
             log.info(f'Scheduling media server updates')
@@ -398,7 +477,7 @@ def download_media(media_id):
     else:
         # Expected file doesn't exist on disk
         err = (f'Failed to download media: {media} (UUID: {media.pk}) to disk, '
-               f'expected outfile does not exist: {media.filepath}')
+               f'expected outfile does not exist: {filepath}')
         log.error(err)
         # Raising an error here triggers the task to be re-attempted (or fail)
         raise DownloadFailedException(err)
@@ -417,3 +496,39 @@ def rescan_media_server(mediaserver_id):
     # Request an rescan / update
     log.info(f'Updating media server: {mediaserver}')
     mediaserver.update()
+
+
+@background(schedule=0)
+def save_all_media_for_source(source_id):
+    '''
+        Iterates all media items linked to a source and saves them to
+        trigger the post_save signal for every media item. Used when a
+        source has its parameters changed and all media needs to be
+        checked to see if its download status has changed.
+    '''
+    try:
+        source = Source.objects.get(pk=source_id)
+    except Source.DoesNotExist:
+        # Task triggered but the source no longer exists, do nothing
+        log.error(f'Task save_all_media_for_source(pk={source_id}) called but no '
+                  f'source exists with ID: {source_id}')
+        return
+    # Trigger the post_save signal for each media item linked to this source as various
+    # flags may need to be recalculated
+    for media in Media.objects.filter(source=source):
+        media.save()
+
+
+@background(schedule=0)
+def rename_all_media_for_source(source_id):
+    try:
+        source = Source.objects.get(pk=source_id)
+    except Source.DoesNotExist:
+        # Task triggered but the source no longer exists, do nothing
+        log.error(f'Task rename_all_media_for_source(pk={source_id}) called but no '
+                  f'source exists with ID: {source_id}')
+        return
+    for media in Media.objects.filter(source=source):
+        media.rename_files()
+
+

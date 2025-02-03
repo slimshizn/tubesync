@@ -1,18 +1,24 @@
+import glob
 import os
 import json
 from base64 import b64decode
+import pathlib
+import shutil
+import sys
 from django.conf import settings
-from django.http import Http404
+from django.http import FileResponse, Http404, HttpResponseNotFound, HttpResponseRedirect
 from django.views.generic import TemplateView, ListView, DetailView
 from django.views.generic.edit import (FormView, FormMixin, CreateView, UpdateView,
                                        DeleteView)
 from django.views.generic.detail import SingleObjectMixin
+from django.core.exceptions import SuspiciousFileOperation
 from django.http import HttpResponse
 from django.urls import reverse_lazy
-from django.db import IntegrityError
+from django.db import connection, IntegrityError
 from django.db.models import Q, Count, Sum, When, Case
-from django.forms import ValidationError
+from django.forms import Form, ValidationError
 from django.utils.text import slugify
+from django.utils._os import safe_join
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from common.utils import append_uri_params
@@ -55,7 +61,7 @@ class DashboardView(TemplateView):
         # Disk usage
         disk_usage = Media.objects.filter(
             downloaded=True, downloaded_filesize__isnull=False
-        ).aggregate(Sum('downloaded_filesize'))
+        ).defer('metadata').aggregate(Sum('downloaded_filesize'))
         data['disk_usage_bytes'] = disk_usage['downloaded_filesize__sum']
         if not data['disk_usage_bytes']:
             data['disk_usage_bytes'] = 0
@@ -66,12 +72,12 @@ class DashboardView(TemplateView):
             data['average_bytes_per_media'] = 0
         # Latest downloads
         data['latest_downloads'] = Media.objects.filter(
-            downloaded=True
-        ).order_by('-download_date')[:10]
+            downloaded=True, downloaded_filesize__isnull=False
+        ).defer('metadata').order_by('-download_date')[:10]
         # Largest downloads
         data['largest_downloads'] = Media.objects.filter(
             downloaded=True, downloaded_filesize__isnull=False
-        ).order_by('-downloaded_filesize')[:10]
+        ).defer('metadata').order_by('-downloaded_filesize')[:10]
         # UID and GID
         data['uid'] = os.getuid()
         data['gid'] = os.getgid()
@@ -79,6 +85,12 @@ class DashboardView(TemplateView):
         data['config_dir'] = str(settings.CONFIG_BASE_DIR)
         data['downloads_dir'] = str(settings.DOWNLOAD_ROOT)
         data['database_connection'] = settings.DATABASE_CONNECTION_STR
+        # Add the database filesize when using db.sqlite3
+        data['database_filesize'] = None
+        db_name = str(connection.get_connection_params()['database'])
+        db_path = pathlib.Path(db_name) if '/' == db_name[0] else None
+        if db_path and 'sqlite' == connection.vendor:
+            data['database_filesize'] = db_path.stat().st_size
         return data
 
 
@@ -92,7 +104,26 @@ class SourcesView(ListView):
     paginate_by = settings.SOURCES_PER_PAGE
     messages = {
         'source-deleted': _('Your selected source has been deleted.'),
+        'source-refreshed': _('The source has been scheduled to be synced now.')
     }
+
+    def get(self, *args, **kwargs):
+        if args[0].path.startswith("/source-sync-now/"):
+            sobj = Source.objects.get(pk=kwargs["pk"])
+            if sobj is None:
+                return HttpResponseNotFound()
+
+            verbose_name = _('Index media from source "{}" once')
+            index_source_task(
+                str(sobj.pk),
+                queue=str(sobj.pk),
+                repeat=0,
+                verbose_name=verbose_name.format(sobj.name))
+            url = reverse_lazy('sync:sources')
+            url = append_uri_params(url, {'message': 'source-refreshed'})
+            return HttpResponseRedirect(url)
+        else:
+            return super().get(self, *args, **kwargs)    
 
     def __init__(self, *args, **kwargs):
         self.message = None
@@ -168,10 +199,15 @@ class ValidateSourceView(FormView):
         Source.SOURCE_TYPE_YOUTUBE_PLAYLIST: ('https://www.youtube.com/playlist?list='
                                               'PL590L5WQmH8dpP0RyH5pCfIaDEdt9nk7r')
     }
+    _youtube_domains = frozenset({
+        'youtube.com',
+        'm.youtube.com',
+        'www.youtube.com',
+    })
     validation_urls = {
         Source.SOURCE_TYPE_YOUTUBE_CHANNEL: {
             'scheme': 'https',
-            'domain': 'www.youtube.com',
+            'domains': _youtube_domains,
             'path_regex': '^\/(c\/)?([^\/]+)(\/videos)?$',
             'path_must_not_match': ('/playlist', '/c/playlist'),
             'qs_args': [],
@@ -180,7 +216,7 @@ class ValidateSourceView(FormView):
         },
         Source.SOURCE_TYPE_YOUTUBE_CHANNEL_ID: {
             'scheme': 'https',
-            'domain': 'www.youtube.com',
+            'domains': _youtube_domains,
             'path_regex': '^\/channel\/([^\/]+)(\/videos)?$',
             'path_must_not_match': ('/playlist', '/c/playlist'),
             'qs_args': [],
@@ -189,7 +225,7 @@ class ValidateSourceView(FormView):
         },
         Source.SOURCE_TYPE_YOUTUBE_PLAYLIST: {
             'scheme': 'https',
-            'domain': 'www.youtube.com',
+            'domains': _youtube_domains,
             'path_regex': '^\/(playlist|watch)$',
             'path_must_not_match': (),
             'qs_args': ('list',),
@@ -261,31 +297,93 @@ class ValidateSourceView(FormView):
         url = reverse_lazy('sync:add-source')
         fields_to_populate = self.prepopulate_fields.get(self.source_type)
         fields = {}
+        value = self.key
+        use_channel_id = (
+            'youtube-channel' == self.source_type_str and
+            '@' == self.key[0]
+        )
+        if use_channel_id:
+            old_key = self.key
+            old_source_type = self.source_type
+            old_source_type_str = self.source_type_str
+
+            self.source_type_str = 'youtube-channel-id'
+            self.source_type = self.source_types.get(self.source_type_str, None)
+            index_url = Source.create_index_url(self.source_type, self.key, 'videos')
+            try:
+                self.key = youtube.get_channel_id(
+                    index_url.replace('/channel/', '/')
+                )
+            except youtube.YouTubeError as e:
+                # It did not work, revert to previous behavior
+                self.key = old_key
+                self.source_type = old_source_type
+                self.source_type_str = old_source_type_str
+
         for field in fields_to_populate:
             if field == 'source_type':
                 fields[field] = self.source_type
-            elif field in ('key', 'name', 'directory'):
+            elif field == 'key':
                 fields[field] = self.key
+            elif field in ('name', 'directory'):
+                fields[field] = value
         return append_uri_params(url, fields)
 
 
-class AddSourceView(CreateView):
+class EditSourceMixin:
+    model = Source
+    fields = ('source_type', 'key', 'name', 'directory', 'filter_text', 'filter_text_invert', 'filter_seconds', 'filter_seconds_min',
+              'media_format', 'index_schedule', 'index_videos', 'index_streams', 'download_media', 'download_cap', 'delete_old_media',
+              'delete_removed_media', 'days_to_keep', 'source_resolution', 'source_vcodec',
+              'source_acodec', 'prefer_60fps', 'prefer_hdr', 'fallback', 'copy_channel_images',
+              'delete_removed_media', 'delete_files_on_disk', 'days_to_keep', 'source_resolution',
+              'source_vcodec', 'source_acodec', 'prefer_60fps', 'prefer_hdr', 'fallback', 'copy_channel_images',
+              'copy_thumbnails', 'write_nfo', 'write_json', 'embed_metadata', 'embed_thumbnail',
+              'enable_sponsorblock', 'sponsorblock_categories', 'write_subtitles',
+              'auto_subtitles', 'sub_langs')
+    errors = {
+        'invalid_media_format': _('Invalid media format, the media format contains '
+                                  'errors or is empty. Check the table at the end of '
+                                  'this page for valid media name variables'),
+        'dir_outside_dlroot': _('You cannot specify a directory outside of the '
+                                'base directory (%BASEDIR%)')
+    }
+
+    def form_valid(self, form: Form):
+        # Perform extra validation to make sure the media_format is valid
+        obj = form.save(commit=False)
+        source_type = form.cleaned_data['media_format']
+        example_media_file = obj.get_example_media_format()
+
+        if example_media_file == '':
+            form.add_error(
+                'media_format',
+                ValidationError(self.errors['invalid_media_format'])
+            )
+
+        # Check for suspicious file path(s)
+        try:
+            targetCheck = form.cleaned_data['directory']+"/.virt"
+            newdir = safe_join(settings.DOWNLOAD_ROOT,targetCheck)
+        except SuspiciousFileOperation:
+            form.add_error(
+                'directory',
+                ValidationError(self.errors['dir_outside_dlroot'].replace("%BASEDIR%",str(settings.DOWNLOAD_ROOT)))
+            )
+
+        if form.errors:
+            return super().form_invalid(form)
+
+        return super().form_valid(form)
+
+
+class AddSourceView(EditSourceMixin, CreateView):
     '''
         Adds a new source, optionally takes some initial data querystring values to
         prepopulate some of the more unclear values.
     '''
 
     template_name = 'sync/source-add.html'
-    model = Source
-    fields = ('source_type', 'key', 'name', 'directory', 'media_format',
-              'index_schedule', 'download_media', 'download_cap', 'delete_old_media',
-              'days_to_keep', 'source_resolution', 'source_vcodec', 'source_acodec',
-              'prefer_60fps', 'prefer_hdr', 'fallback', 'copy_thumbnails', 'write_nfo', 'write_json')
-    errors = {
-        'invalid_media_format': _('Invalid media format, the media format contains '
-                                  'errors or is empty. Check the table at the end of '
-                                  'this page for valid media name variables'),
-    }
 
     def __init__(self, *args, **kwargs):
         self.prepopulated_data = {}
@@ -311,20 +409,6 @@ class AddSourceView(CreateView):
         for k, v in self.prepopulated_data.items():
             initial[k] = v
         return initial
-
-    def form_valid(self, form):
-        # Perform extra validation to make sure the media_format is valid
-        obj = form.save(commit=False)
-        source_type = form.cleaned_data['media_format']
-        example_media_file = obj.get_example_media_format()
-        if example_media_file == '':
-            form.add_error(
-                'media_format',
-                ValidationError(self.errors['invalid_media_format'])
-            )
-        if form.errors:
-            return super().form_invalid(form)
-        return super().form_valid(form)
 
     def get_success_url(self):
         url = reverse_lazy('sync:source', kwargs={'pk': self.object.pk})
@@ -360,37 +444,13 @@ class SourceView(DetailView):
             error_message = get_error_message(error)
             setattr(error, 'error_message', error_message)
             data['errors'].append(error)
-        data['media'] = Media.objects.filter(source=self.object).order_by('-published')
+        data['media'] = Media.objects.filter(source=self.object).order_by('-published').defer('metadata')
         return data
 
 
-class UpdateSourceView(UpdateView):
+class UpdateSourceView(EditSourceMixin, UpdateView):
 
     template_name = 'sync/source-update.html'
-    model = Source
-    fields = ('source_type', 'key', 'name', 'directory', 'media_format',
-              'index_schedule', 'download_media', 'download_cap', 'delete_old_media',
-              'days_to_keep', 'source_resolution', 'source_vcodec', 'source_acodec',
-              'prefer_60fps', 'prefer_hdr', 'fallback', 'copy_thumbnails', 'write_nfo', 'write_json')
-    errors = {
-        'invalid_media_format': _('Invalid media format, the media format contains '
-                                  'errors or is empty. Check the table at the end of '
-                                  'this page for valid media name variables'),
-    }
-
-    def form_valid(self, form):
-        # Perform extra validation to make sure the media_format is valid
-        obj = form.save(commit=False)
-        source_type = form.cleaned_data['media_format']
-        example_media_file = obj.get_example_media_format()
-        if example_media_file == '':
-            form.add_error(
-                'media_format',
-                ValidationError(self.errors['invalid_media_format'])
-            )
-        if form.errors:
-            return super().form_invalid(form)
-        return super().form_valid(form)
 
     def get_success_url(self):
         url = reverse_lazy('sync:source', kwargs={'pk': self.object.pk})
@@ -415,14 +475,13 @@ class DeleteSourceView(DeleteView, FormMixin):
             source = self.get_object()
             for media in Media.objects.filter(source=source):
                 if media.media_file:
-                    # Delete the media file
-                    delete_file(media.media_file.name)
-                    # Delete thumbnail copy if it exists
-                    delete_file(media.thumbpath)
-                    # Delete NFO file if it exists
-                    delete_file(media.nfopath)
-                    # Delete JSON file if it exists
-                    delete_file(media.jsonpath)
+                    file_path = media.media_file.path
+                    matching_files = glob.glob(os.path.splitext(file_path)[0] + '.*')
+                    for file in matching_files:
+                        delete_file(file)
+            directory_path = source.directory_path
+            if os.path.exists(directory_path):
+                shutil.rmtree(directory_path, True)
         return super().post(request, *args, **kwargs)
 
     def get_success_url(self):
@@ -465,20 +524,15 @@ class MediaView(ListView):
         return super().dispatch(request, *args, **kwargs)
 
     def get_queryset(self):
+        q = Media.objects.all()
+
         if self.filter_source:
-            if self.show_skipped:
-                q = Media.objects.filter(source=self.filter_source)
-            elif self.only_skipped:
-                q = Media.objects.filter(source=self.filter_source, skip=True)
-            else:
-                q = Media.objects.filter(source=self.filter_source, skip=False)
-        else:
-            if self.show_skipped:
-                q = Media.objects.all()
-            elif self.only_skipped:
-                q = Media.objects.filter(skip=True)
-            else:
-                q = Media.objects.filter(skip=False)
+            q = q.filter(source=self.filter_source)
+        if self.only_skipped:
+            q = q.filter(Q(can_download=False) | Q(skip=True) | Q(manual_skip=True))
+        elif not self.show_skipped:
+            q = q.filter(Q(can_download=True) & Q(skip=False) & Q(manual_skip=False))
+
         return q.order_by('-published', '-created')
 
     def get_context_data(self, *args, **kwargs):
@@ -559,6 +613,8 @@ class MediaItemView(DetailView):
         data['video_exact'] = video_exact
         data['video_format'] = video_format
         data['youtube_dl_format'] = self.object.get_format_str()
+        data['filename_path'] = pathlib.Path(self.object.filename)
+        data['media_file_path'] = pathlib.Path(self.object.media_file.path) if self.object.media_file else None
         return data
 
 
@@ -633,12 +689,13 @@ class MediaSkipView(FormView, SingleObjectMixin):
         delete_task_by_media('sync.tasks.download_media', (str(self.object.pk),))
         # If the media file exists on disk, delete it
         if self.object.media_file_exists:
-            delete_file(self.object.media_file.path)
-            self.object.media_file = None
-            # If the media has an associated thumbnail copied, also delete it
-            delete_file(self.object.thumbpath)
-            # If the media has an associated NFO file with it, also delete it
-            delete_file(self.object.nfopath)
+            # Delete all files which contains filename
+            filepath = self.object.media_file.path
+            barefilepath, fileext = os.path.splitext(filepath)
+            # Get all files that start with the bare file path
+            all_related_files = glob.glob(f'{barefilepath}.*')
+            for file in all_related_files:
+                delete_file(file)
         # Reset all download data
         self.object.metadata = None
         self.object.downloaded = False
@@ -650,6 +707,7 @@ class MediaSkipView(FormView, SingleObjectMixin):
         self.object.downloaded_filesize = None
         # Mark it to be skipped
         self.object.skip = True
+        self.object.manual_skip = True
         self.object.save()
         return super().form_valid(form)
 
@@ -678,12 +736,59 @@ class MediaEnableView(FormView, SingleObjectMixin):
     def form_valid(self, form):
         # Mark it as not skipped
         self.object.skip = False
+        self.object.manual_skip = False
         self.object.save()
         return super().form_valid(form)
 
     def get_success_url(self):
         url = reverse_lazy('sync:media-item', kwargs={'pk': self.object.pk})
         return append_uri_params(url, {'message': 'enabled'})
+
+
+class MediaContent(DetailView):
+    '''
+        Redirect to nginx to download the file
+    '''
+    model = Media
+
+    def __init__(self, *args, **kwargs):
+        self.object = None
+        super().__init__(*args, **kwargs)
+
+    def dispatch(self, request, *args, **kwargs):
+        self.object = self.get_object()
+        # development direct file stream - DO NOT USE PRODUCTIVLY
+        if settings.DEBUG and 'runserver' in sys.argv:
+            # get media URL
+            pth = self.object.media_file.url
+            # remove "/media-data/"
+            pth = pth.split("/media-data/",1)[1]
+            # remove "/" (incase of absolute path)
+            pth = pth.split(str(settings.DOWNLOAD_ROOT).lstrip("/"),1)
+
+            # if we do not have a "/" at the beginning, it is not a absolute path...
+            if len(pth) > 1:
+                pth = pth[1]
+            else:
+                pth = pth[0]
+
+
+            # build final path
+            filepth = pathlib.Path(str(settings.DOWNLOAD_ROOT) + pth)
+
+            if filepth.exists():
+                # return file
+                response = FileResponse(open(filepth,'rb'))
+                return response
+            else:
+                return HttpResponseNotFound()
+
+        else:
+            headers = {
+                'Content-Type': self.object.content_type,
+                'X-Accel-Redirect': self.object.media_file.url,
+            }
+            return HttpResponse(headers=headers)
 
 
 class TasksView(ListView):

@@ -1,28 +1,33 @@
 import os
 import uuid
 import json
+import re
 from xml.etree import ElementTree
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 from django.conf import settings
 from django.db import models
+from django.core.exceptions import SuspiciousOperation
 from django.core.files.storage import FileSystemStorage
+from django.core.validators import RegexValidator
 from django.utils.text import slugify
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from common.logger import log
 from common.errors import NoFormatException
-from common.utils import clean_filename
+from common.utils import clean_filename, clean_emoji
 from .youtube import (get_media_info as get_youtube_media_info,
-                      download_media as download_youtube_media)
-from .utils import seconds_to_timestr, parse_media_format
-from .matching import (get_best_combined_format, get_best_audio_format, 
+                      download_media as download_youtube_media,
+                      get_channel_image_info as get_youtube_channel_image_info)
+from .utils import (seconds_to_timestr, parse_media_format, filter_response,
+                    write_text_file, mkdir_p, directory_and_stem, glob_quote)
+from .matching import (get_best_combined_format, get_best_audio_format,
                        get_best_video_format)
 from .mediaservers import PlexMediaServer
+from .fields import CommaSepChoiceField, SponsorBlock_Category
 
-
-media_file_storage = FileSystemStorage(location=str(settings.DOWNLOAD_ROOT))
-
+media_file_storage = FileSystemStorage(location=str(settings.DOWNLOAD_ROOT), base_url='/media-data/')
 
 class Source(models.Model):
     '''
@@ -101,10 +106,41 @@ class Source(models.Model):
         (FALLBACK_NEXT_BEST_HD, _('Get next best resolution but at least HD'))
     )
 
+    FILTER_SECONDS_CHOICES = (
+        (True, _('Minimum Length')),
+        (False, _('Maximum Length')),
+    )
+
     EXTENSION_M4A = 'm4a'
     EXTENSION_OGG = 'ogg'
     EXTENSION_MKV = 'mkv'
     EXTENSIONS = (EXTENSION_M4A, EXTENSION_OGG, EXTENSION_MKV)
+
+    sponsorblock_categories = CommaSepChoiceField(
+        _(''),
+        max_length=128,
+        possible_choices=SponsorBlock_Category.choices,
+        all_choice='all',
+        allow_all=True,
+        all_label='(All Categories)',
+        default='all',
+        help_text=_('Select the SponsorBlock categories that you wish to be removed from downloaded videos.')
+    )
+    embed_metadata = models.BooleanField(
+        _('embed metadata'),
+        default=False,
+        help_text=_('Embed metadata from source into file')
+    )
+    embed_thumbnail = models.BooleanField(
+        _('embed thumbnail'),
+        default=False,
+        help_text=_('Embed thumbnail into the file')
+    )
+    enable_sponsorblock = models.BooleanField(
+        _('enable sponsorblock'),
+        default=True,
+        help_text=_('Use SponsorBlock?')
+    )
 
     # Fontawesome icons used for the source on the front end
     ICONS = {
@@ -120,8 +156,8 @@ class Source(models.Model):
     }
     # Format used to create indexable URLs
     INDEX_URLS = {
-        SOURCE_TYPE_YOUTUBE_CHANNEL: 'https://www.youtube.com/c/{key}/videos',
-        SOURCE_TYPE_YOUTUBE_CHANNEL_ID: 'https://www.youtube.com/channel/{key}/videos',
+        SOURCE_TYPE_YOUTUBE_CHANNEL: 'https://www.youtube.com/c/{key}/{type}',
+        SOURCE_TYPE_YOUTUBE_CHANNEL_ID: 'https://www.youtube.com/channel/{key}/{type}',
         SOURCE_TYPE_YOUTUBE_PLAYLIST: 'https://www.youtube.com/playlist?list={key}',
     }
     # Callback functions to get a list of media from the source
@@ -229,6 +265,16 @@ class Source(models.Model):
         default=True,
         help_text=_('Download media from this source, if not selected the source will only be indexed')
     )
+    index_videos = models.BooleanField(
+        _('index videos'),
+        default=True,
+        help_text=_('Index video media from this source')
+    )
+    index_streams = models.BooleanField(
+        _('index streams'),
+        default=False,
+        help_text=_('Index live stream media from this source')
+    )
     download_cap = models.IntegerField(
         _('download cap'),
         choices=CapChoices.choices,
@@ -245,6 +291,41 @@ class Source(models.Model):
         default=14,
         help_text=_('If "delete old media" is ticked, the number of days after which '
                     'to automatically delete media')
+    )
+    filter_text = models.CharField(
+        _('filter string'),
+        max_length=200,
+        default='',
+        blank=True,
+        help_text=_('Regex compatible filter string for video titles')
+    )
+    filter_text_invert = models.BooleanField(
+        _("invert filter text matching"),
+        default=False,
+        help_text="Invert filter string regex match, skip any matching titles when selected",
+    )
+    filter_seconds = models.PositiveIntegerField(
+                _('filter seconds'),
+                blank=True,
+                null=True,
+                help_text=_('Filter Media based on Min/Max duration. Leave blank or 0 to disable filtering')
+    )
+    filter_seconds_min = models.BooleanField(
+        _('filter seconds min/max'),
+        choices=FILTER_SECONDS_CHOICES,
+        default=True,
+        help_text=_('When Filter Seconds is > 0, do we skip on minimum (video shorter than limit) or maximum (video '
+                    'greater than maximum) video duration')
+    )
+    delete_removed_media = models.BooleanField(
+        _('delete removed media'),
+        default=False,
+        help_text=_('Delete media that is no longer on this playlist')
+    )
+    delete_files_on_disk = models.BooleanField(
+        _('delete files on disk'),
+        default=False,
+        help_text=_('Delete files on disk when they are removed from TubeSync')
     )
     source_resolution = models.CharField(
         _('source resolution'),
@@ -288,6 +369,11 @@ class Source(models.Model):
         default=FALLBACK_NEXT_BEST_HD,
         help_text=_('What do do when media in your source resolution and codecs is not available')
     )
+    copy_channel_images = models.BooleanField(
+        _('copy channel images'),
+        default=False,
+        help_text=_('Copy channel banner and avatar. These may be detected and used by some media servers')
+    )
     copy_thumbnails = models.BooleanField(
         _('copy thumbnails'),
         default=False,
@@ -307,6 +393,30 @@ class Source(models.Model):
         _('has failed'),
         default=False,
         help_text=_('Source has failed to index media')
+    )
+
+    write_subtitles = models.BooleanField(
+        _('write subtitles'),
+        default=False,
+        help_text=_('Download video subtitles')
+    )
+
+    auto_subtitles = models.BooleanField(
+        _('accept auto-generated subs'),
+        default=False,
+        help_text=_('Accept auto-generated subtitles')
+    )
+    sub_langs = models.CharField(
+        _('subs langs'),
+        max_length=30,
+        default='en',
+        help_text=_('List of subtitles langs to download, comma-separated. Example: en,fr or all,-fr,-live_chat'),
+        validators=[
+            RegexValidator(
+                regex=r"^(\-?[\_\.a-zA-Z-]+(,|$))+",
+                message=_('Subtitle langs must be a comma-separated list of langs. example: en,fr or all,-fr,-live_chat')
+            )
+        ]
     )
 
     def __str__(self):
@@ -342,6 +452,14 @@ class Source(models.Model):
             return False
 
     @property
+    def days_to_keep_date(self):
+        delta = self.days_to_keep
+        if delta > 0:
+            return timezone.now() - timedelta(days=delta)
+        else:
+            return False
+
+    @property
     def extension(self):
         '''
             The extension is also used by youtube-dl to set the output container. As
@@ -366,17 +484,16 @@ class Source(models.Model):
         return url.format(key=key)
 
     @classmethod
-    def create_index_url(obj, source_type, key):
+    def create_index_url(obj, source_type, key, type):
         url = obj.INDEX_URLS.get(source_type)
-        return url.format(key=key)
+        return url.format(key=key, type=type)
 
     @property
     def url(self):
         return Source.create_url(self.source_type, self.key)
 
-    @property
-    def index_url(self):
-        return Source.create_index_url(self.source_type, self.key)
+    def get_index_url(self, type):
+        return Source.create_index_url(self.source_type, self.key, type)
 
     @property
     def format_summary(self):
@@ -392,13 +509,28 @@ class Source(models.Model):
     @property
     def directory_path(self):
         download_dir = Path(media_file_storage.location)
-        if self.source_resolution == self.SOURCE_RESOLUTION_AUDIO:
-            return download_dir / settings.DOWNLOAD_AUDIO_DIR / self.directory
+        return download_dir / self.type_directory_path
+
+    @property
+    def type_directory_path(self):
+        if settings.SOURCE_DOWNLOAD_DIRECTORY_PREFIX:
+            if self.source_resolution == self.SOURCE_RESOLUTION_AUDIO:
+                return Path(settings.DOWNLOAD_AUDIO_DIR) / self.directory
+            else:
+                return Path(settings.DOWNLOAD_VIDEO_DIR) / self.directory
         else:
-            return download_dir / settings.DOWNLOAD_VIDEO_DIR / self.directory
+            return Path(self.directory)
 
     def make_directory(self):
         return os.makedirs(self.directory_path, exist_ok=True)
+
+    @property
+    def get_image_url(self):
+        if self.source_type == self.SOURCE_TYPE_YOUTUBE_PLAYLIST:
+            raise SuspiciousOperation('This source is a playlist so it doesn\'t have thumbnail.')
+
+        return get_youtube_channel_image_info(self.url)
+
 
     def directory_exists(self):
         return (os.path.isdir(self.directory_path) and
@@ -442,11 +574,13 @@ class Source(models.Model):
             'dd': now.strftime('%d'),
             'source': self.slugname,
             'source_full': self.name,
+            'uploader': 'Some Channel Name',
             'title': 'some-media-title-name',
             'title_full': 'Some Media Title Name',
             'key': 'SoMeUnIqUiD',
             'format': '-'.join(fmt),
             'playlist_title': 'Some Playlist Title',
+            'video_order': '01',
             'ext': self.extension,
             'resolution': self.source_resolution if self.source_resolution else '',
             'height': '720' if self.source_resolution else '',
@@ -463,18 +597,36 @@ class Source(models.Model):
         except Exception as e:
             return ''
 
+    def is_regex_match(self, media_item_title):
+        if not self.filter_text:
+            return True
+        return bool(re.search(self.filter_text, media_item_title))
+
+    def get_index(self, type):
+        indexer = self.INDEXERS.get(self.source_type, None)
+        if not callable(indexer):
+            raise Exception(f'Source type f"{self.source_type}" has no indexer')
+        response = indexer(self.get_index_url(type=type))
+        if not isinstance(response, dict):
+            return []
+        entries = response.get('entries', []) 
+        return entries
+
     def index_media(self):
         '''
             Index the media source returning a list of media metadata as dicts.
         '''
-        indexer = self.INDEXERS.get(self.source_type, None)
-        if not callable(indexer):
-            raise Exception(f'Source type f"{self.source_type}" has no indexer')
-        response = indexer(self.index_url)
-        if not isinstance(response, dict):
-            return []
-        return response.get('entries', [])
+        entries = list()
+        if self.index_videos:
+            entries += self.get_index('videos')
+        # Playlists do something different that I have yet to figure out
+        if self.source_type != Source.SOURCE_TYPE_YOUTUBE_PLAYLIST:
+            if self.index_streams:
+                entries += self.get_index('streams')
 
+        if settings.MAX_ENTRIES_PROCESSING:
+            entries = entries[:settings.MAX_ENTRIES_PROCESSING]
+        return entries
 
 def get_media_thumb_path(instance, filename):
     fileid = str(instance.uuid)
@@ -671,7 +823,13 @@ class Media(models.Model):
         _('skip'),
         db_index=True,
         default=False,
-        help_text=_('Media will be skipped and not downloaded')
+        help_text=_('INTERNAL FLAG - Media will be skipped and not downloaded')
+    )
+    manual_skip = models.BooleanField(
+        _('manual_skip'),
+        db_index=True,
+        default=False,
+        help_text=_('Media marked as "skipped", won\'t be downloaded')
     )
     downloaded = models.BooleanField(
         _('downloaded'),
@@ -744,6 +902,20 @@ class Media(models.Model):
         null=True,
         help_text=_('Size of the downloaded media in bytes')
     )
+    duration = models.PositiveIntegerField(
+        _('duration'),
+        blank=True,
+        null=True,
+        help_text=_('Duration of media in seconds')
+    )
+    title = models.CharField(
+        _('title'),
+        max_length=200,
+        blank=True,
+        null=False,
+        default='',
+        help_text=_('Video title')
+    )
 
     def __str__(self):
         return self.key
@@ -754,6 +926,21 @@ class Media(models.Model):
         unique_together = (
             ('source', 'key'),
         )
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
+        # Trigger an update of derived fields from metadata
+        if self.metadata:
+            self.title = self.metadata_title
+            self.duration = self.metadata_duration
+        if update_fields is not None and "metadata" in update_fields:
+            # If only some fields are being updated, make sure we update title and duration if metadata changes
+            update_fields = {"title", "duration"}.union(update_fields)
+
+        super().save(
+            force_insert=force_insert,
+            force_update=force_update,
+            using=using,
+            update_fields=update_fields,)
 
     def get_metadata_field(self, field):
         fields = self.METADATA_FIELDS.get(field, {})
@@ -771,7 +958,7 @@ class Media(models.Model):
 
     def get_best_video_format(self):
         return get_best_video_format(self)
-    
+
     def get_format_str(self):
         '''
             Returns a youtube-dl compatible format string for the best matches
@@ -796,7 +983,7 @@ class Media(models.Model):
                 else:
                     return False
         return False
-    
+ 
     def get_display_format(self, format_str):
         '''
             Returns a tuple used in the format component of the output filename. This
@@ -862,7 +1049,7 @@ class Media(models.Model):
         # Otherwise, calculate from matched format codes
         vformat = None
         aformat = None
-        if '+' in format_str:
+        if format_str and '+' in format_str:
             # Seperate audio and video streams
             vformat_code, aformat_code = format_str.split('+')
             vformat = self.get_format_by_code(vformat_code)
@@ -871,7 +1058,7 @@ class Media(models.Model):
             # Combined stream or audio only
             cformat = self.get_format_by_code(format_str)
             aformat = cformat
-            if cformat['vcodec']:
+            if cformat and cformat['vcodec']:
                 # Combined
                 vformat = cformat
         if vformat:
@@ -927,12 +1114,13 @@ class Media(models.Model):
             'mm': dateobj.strftime('%m'),
             'dd': dateobj.strftime('%d'),
             'source': self.source.slugname,
-            'source_full': self.source.name,
+            'source_full': clean_filename(self.source.name),
             'title': self.slugtitle,
             'title_full': clean_filename(self.title),
             'key': self.key,
             'format': '-'.join(display_format['format']),
             'playlist_title': self.playlist_title,
+            'video_order': self.get_episode_str(True),
             'ext': self.source.extension,
             'resolution': display_format['resolution'],
             'height': display_format['height'],
@@ -941,14 +1129,46 @@ class Media(models.Model):
             'acodec': display_format['acodec'],
             'fps': display_format['fps'],
             'hdr': display_format['hdr'],
+            'uploader': self.uploader,
         }
 
     @property
     def has_metadata(self):
         return self.metadata is not None
 
+
+    @property
+    def reduce_data(self):
+        try:
+            from common.logger import log
+            from common.utils import json_serial
+
+            old_mdl = len(self.metadata or "")
+            data = json.loads(self.metadata or "{}")
+            compact_json = json.dumps(data, separators=(',', ':'), default=json_serial)
+
+            filtered_data = filter_response(data, True)
+            filtered_json = json.dumps(filtered_data, separators=(',', ':'), default=json_serial)
+        except Exception as e:
+            log.exception('reduce_data: %s', e)
+        else:
+            # log the results of filtering / compacting on metadata size
+            new_mdl = len(compact_json)
+            if old_mdl > new_mdl:
+                delta = old_mdl - new_mdl
+                log.info(f'{self.key}: metadata compacted by {delta:,} characters ({old_mdl:,} -> {new_mdl:,})')
+            new_mdl = len(filtered_json)
+            if old_mdl > new_mdl:
+                delta = old_mdl - new_mdl
+                log.info(f'{self.key}: metadata reduced by {delta:,} characters ({old_mdl:,} -> {new_mdl:,})')
+                if getattr(settings, 'SHRINK_OLD_MEDIA_METADATA', False):
+                    self.metadata = filtered_json
+
+
     @property
     def loaded_metadata(self):
+        if getattr(settings, 'SHRINK_OLD_MEDIA_METADATA', False):
+            self.reduce_data
         try:
             data = json.loads(self.metadata)
             if not isinstance(data, dict):
@@ -968,7 +1188,7 @@ class Media(models.Model):
         return self.loaded_metadata.get(field, '').strip()
 
     @property
-    def title(self):
+    def metadata_title(self):
         field = self.get_metadata_field('title')
         return self.loaded_metadata.get(field, '').strip()
 
@@ -1000,19 +1220,19 @@ class Media(models.Model):
             return None
 
     @property
-    def duration(self):
+    def metadata_duration(self):
         field = self.get_metadata_field('duration')
         duration = self.loaded_metadata.get(field, 0)
         try:
             duration = int(duration)
-        except ValueError:
+        except (TypeError, ValueError):
             duration = 0
         return duration
 
     @property
     def duration_formatted(self):
         duration = self.duration
-        if duration > 0:
+        if duration and duration > 0:
             return seconds_to_timestr(duration)
         return '??:??:??'
 
@@ -1066,55 +1286,50 @@ class Media(models.Model):
         return media_format.format(**media_details)
 
     @property
-    def thumbname(self):
-        if self.downloaded and self.media_file:
-            filename = os.path.basename(self.media_file.path)
-        else:
-            filename = self.filename
-        prefix, ext = os.path.splitext(filename)
-        return f'{prefix}.jpg'
-
-    @property
-    def thumbpath(self):
-        return self.source.directory_path / self.thumbname
-
-    @property
-    def nfoname(self):
-        if self.downloaded and self.media_file:
-            filename = os.path.basename(self.media_file.path)
-        else:
-            filename = self.filename
-        prefix, ext = os.path.splitext(filename)
-        return f'{prefix}.nfo'
-    
-    @property
-    def nfopath(self):
-        return self.source.directory_path / self.nfoname
-
-    @property
-    def jsonname(self):
-        if self.downloaded and self.media_file:
-            filename = os.path.basename(self.media_file.path)
-        else:
-            filename = self.filename
-        prefix, ext = os.path.splitext(filename)
-        return f'{prefix}.info.json'
-    
-    @property
-    def jsonpath(self):
-        return self.source.directory_path / self.jsonname
-
-    @property
     def directory_path(self):
-        # Otherwise, create a suitable filename from the source media_format
-        media_format = str(self.source.media_format)
-        media_details = self.format_dict
-        dirname = self.source.directory_path / media_format.format(**media_details)
-        return os.path.dirname(str(dirname))
+        return self.filepath.parent
 
     @property
     def filepath(self):
         return self.source.directory_path / self.filename
+
+    def filename_prefix(self):
+        if self.downloaded and self.media_file:
+            filename = self.media_file.path
+        else:
+            filename = self.filename
+        # The returned prefix should not contain any directories.
+        # So, we do not care about the different directories
+        # used for filename in the cases above.
+        prefix, ext = os.path.splitext(os.path.basename(filename))
+        return prefix
+
+    @property
+    def thumbname(self):
+        prefix = self.filename_prefix()
+        return f'{prefix}.jpg'
+
+    @property
+    def thumbpath(self):
+        return self.directory_path / self.thumbname
+
+    @property
+    def nfoname(self):
+        prefix = self.filename_prefix()
+        return f'{prefix}.nfo'
+
+    @property
+    def nfopath(self):
+        return self.directory_path / self.nfoname
+
+    @property
+    def jsonname(self):
+        prefix = self.filename_prefix()
+        return f'{prefix}.info.json'
+
+    @property
+    def jsonpath(self):
+        return self.directory_path / self.jsonname
 
     @property
     def thumb_file_exists(self):
@@ -1129,6 +1344,29 @@ class Media(models.Model):
         return os.path.exists(self.media_file.path)
 
     @property
+    def content_type(self):
+        if not self.downloaded:
+            return 'video/mp4'
+        vcodec = self.downloaded_video_codec
+        if vcodec is None:
+            acodec = self.downloaded_audio_codec
+            if acodec is None:
+                raise TypeError() # nothing here.
+            acodec = acodec.lower()
+            if acodec == "mp4a":
+                return "audio/mp4"
+            elif acodec == "opus":
+                return "audio/opus"
+            else:
+                # fall-fall-back.
+                return 'audio/ogg'
+        vcodec = vcodec.lower()
+        if vcodec == 'vp9':
+            return 'video/webm'
+        else:
+            return 'video/mp4'
+
+    @property
     def nfoxml(self):
         '''
             Returns an NFO formatted (prettified) XML string.
@@ -1137,14 +1375,29 @@ class Media(models.Model):
         nfo.text = '\n  '
         # title = media metadata title
         title = nfo.makeelement('title', {})
-        title.text = str(self.name).strip()
+        title.text = clean_emoji(self.title)
         title.tail = '\n  '
         nfo.append(title)
         # showtitle = source name
         showtitle = nfo.makeelement('showtitle', {})
-        showtitle.text = str(self.source.name).strip()
+        showtitle.text = clean_emoji(str(self.source.name).strip())
         showtitle.tail = '\n  '
         nfo.append(showtitle)
+        # season = upload date year
+        season = nfo.makeelement('season', {})
+        if self.source.source_type == Source.SOURCE_TYPE_YOUTUBE_PLAYLIST:
+            # If it's a playlist, set season to 1
+            season.text = '1'
+        else:
+            # If it's not a playlist, set season to upload date year
+            season.text = str(self.upload_date.year) if self.upload_date else ''
+        season.tail = '\n  '
+        nfo.append(season)
+        # episode = number of video in the year
+        episode = nfo.makeelement('episode', {})
+        episode.text = self.get_episode_str()
+        episode.tail = '\n  '
+        nfo.append(episode)
         # ratings = media metadata youtube rating
         value = nfo.makeelement('value', {})
         value.text = str(self.rating)
@@ -1155,7 +1408,7 @@ class Media(models.Model):
         rating_attrs = OrderedDict()
         rating_attrs['name'] = 'youtube'
         rating_attrs['max'] = '5'
-        rating_attrs['default'] = 'True'
+        rating_attrs['default'] = 'true'
         rating = nfo.makeelement('rating', rating_attrs)
         rating.text = '\n      '
         rating.append(value)
@@ -1163,12 +1416,13 @@ class Media(models.Model):
         rating.tail = '\n  '
         ratings = nfo.makeelement('ratings', {})
         ratings.text = '\n    '
-        ratings.append(rating)
+        if self.rating is not None:
+            ratings.append(rating)
         ratings.tail = '\n  '
         nfo.append(ratings)
         # plot = media metadata description
         plot = nfo.makeelement('plot', {})
-        plot.text = str(self.description).strip()
+        plot.text = clean_emoji(str(self.description).strip())
         plot.tail = '\n  '
         nfo.append(plot)
         # thumb = local path to media thumbnail
@@ -1180,7 +1434,8 @@ class Media(models.Model):
         mpaa = nfo.makeelement('mpaa', {})
         mpaa.text = str(self.age_limit)
         mpaa.tail = '\n  '
-        nfo.append(mpaa)
+        if self.age_limit and self.age_limit > 0:
+            nfo.append(mpaa)
         # runtime = media metadata duration in seconds
         runtime = nfo.makeelement('runtime', {})
         runtime.text = str(self.duration)
@@ -1201,7 +1456,7 @@ class Media(models.Model):
         nfo.append(uniqueid)
         # studio = media metadata uploader
         studio = nfo.makeelement('studio', {})
-        studio.text = str(self.uploader).strip()
+        studio.text = clean_emoji(str(self.uploader).strip())
         studio.tail = '\n  '
         nfo.append(studio)
         # aired = media metadata uploaded date
@@ -1252,7 +1507,10 @@ class Media(models.Model):
                                     f'no valid format available')
         # Download the media with youtube-dl
         download_youtube_media(self.url, format_str, self.source.extension,
-                               str(self.filepath), self.source.write_json)
+                               str(self.filepath), self.source.write_json,
+                               self.source.sponsorblock_categories.selected_choices, self.source.embed_thumbnail,
+                               self.source.embed_metadata, self.source.enable_sponsorblock,
+                              self.source.write_subtitles, self.source.auto_subtitles,self.source.sub_langs )
         # Return the download paramaters
         return format_str, self.source.extension
 
@@ -1262,9 +1520,115 @@ class Media(models.Model):
         '''
         indexer = self.INDEXERS.get(self.source.source_type, None)
         if not callable(indexer):
-            raise Exception(f'Meida with source type f"{self.source.source_type}" '
+            raise Exception(f'Media with source type f"{self.source.source_type}" '
                             f'has no indexer')
-        return indexer(self.url)
+        response = indexer(self.url)
+        no_formats_available = (
+            not response or
+            "formats" not in response.keys() or
+            0 == len(response["formats"])
+        )
+        if no_formats_available:
+            self.can_download = False
+            self.skip = True
+        return response
+
+    def calculate_episode_number(self):
+        if self.source.source_type == Source.SOURCE_TYPE_YOUTUBE_PLAYLIST:
+            sorted_media = Media.objects.filter(source=self.source)
+        else:
+            self_year = self.upload_date.year if self.upload_date else self.created.year
+            filtered_media = Media.objects.filter(source=self.source, published__year=self_year)
+            filtered_media = [m for m in filtered_media if m.upload_date is not None]
+            sorted_media = sorted(filtered_media, key=lambda x: (x.upload_date, x.key))
+        position_counter = 1
+        for media in sorted_media:
+            if media == self:
+                return position_counter
+            position_counter += 1
+
+    def get_episode_str(self, use_padding=False):
+        episode_number = self.calculate_episode_number()
+        if not episode_number:
+            return ''
+
+        if use_padding:
+            return f'{episode_number:02}'
+
+        return str(episode_number)
+
+    def rename_files(self):
+        if self.downloaded and self.media_file:
+            old_video_path = Path(self.media_file.path)
+            new_video_path = Path(get_media_file_path(self, None))
+            if old_video_path.exists() and not new_video_path.exists():
+                old_video_path = old_video_path.resolve(strict=True)
+
+                # move video to destination
+                mkdir_p(new_video_path.parent)
+                log.debug(f'{self!s}: {old_video_path!s} => {new_video_path!s}')
+                old_video_path.rename(new_video_path)
+                log.info(f'Renamed video file for: {self!s}')
+
+                # collect the list of files to move
+                # this should not include the video we just moved
+                (old_prefix_path, old_stem) = directory_and_stem(old_video_path)
+                other_paths = list(old_prefix_path.glob(glob_quote(old_stem) + '*'))
+                log.info(f'Collected {len(other_paths)} other paths for: {self!s}')
+
+                # adopt orphaned files, if possible
+                media_format = str(self.source.media_format)
+                top_dir_path = Path(self.source.directory_path)
+                if '{key}' in media_format:
+                    fuzzy_paths = list(top_dir_path.rglob('*' + glob_quote(str(self.key)) + '*'))
+                    log.info(f'Collected {len(fuzzy_paths)} fuzzy paths for: {self!s}')
+
+                if new_video_path.exists():
+                    new_video_path = new_video_path.resolve(strict=True)
+
+                    # update the media_file in the db
+                    self.media_file.name = str(new_video_path.relative_to(self.media_file.storage.location))
+                    self.save()
+                    log.info(f'Updated "media_file" in the database for: {self!s}')
+
+                    (new_prefix_path, new_stem) = directory_and_stem(new_video_path)
+
+                    # move and change names to match stem
+                    for other_path in other_paths:
+                        old_file_str = other_path.name
+                        new_file_str = new_stem + old_file_str[len(old_stem):]
+                        new_file_path = Path(new_prefix_path / new_file_str)
+                        log.debug(f'Considering replace for: {self!s}\n\t{other_path!s}\n\t{new_file_path!s}')
+                        # it should exist, but check anyway 
+                        if other_path.exists():
+                            log.debug(f'{self!s}: {other_path!s} => {new_file_path!s}')
+                            other_path.replace(new_file_path)
+
+                    for fuzzy_path in fuzzy_paths:
+                        (fuzzy_prefix_path, fuzzy_stem) = directory_and_stem(fuzzy_path)
+                        old_file_str = fuzzy_path.name
+                        new_file_str = new_stem + old_file_str[len(fuzzy_stem):]
+                        new_file_path = Path(new_prefix_path / new_file_str)
+                        log.debug(f'Considering rename for: {self!s}\n\t{fuzzy_path!s}\n\t{new_file_path!s}')
+                        # it quite possibly was renamed already
+                        if fuzzy_path.exists() and not new_file_path.exists():
+                            log.debug(f'{self!s}: {fuzzy_path!s} => {new_file_path!s}')
+                            fuzzy_path.rename(new_file_path)
+
+                    # The thumbpath inside the .nfo file may have changed
+                    if self.source.write_nfo and self.source.copy_thumbnails:
+                        write_text_file(new_prefix_path / self.nfopath.name, self.nfoxml)
+                        log.info(f'Wrote new ".nfo" file for: {self!s}')
+
+                    # try to remove empty dirs
+                    parent_dir = old_video_path.parent
+                    try:
+                        while parent_dir.is_dir():
+                            parent_dir.rmdir()
+                            log.info(f'Removed empty directory: {parent_dir!s}')
+                            parent_dir = parent_dir.parent
+                    except OSError as e:
+                        pass
 
 
 class MediaServer(models.Model):
